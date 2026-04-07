@@ -19,6 +19,7 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+TOKEN_CHUNK_LIMIT = 20000
 
 
 def read_text_file(path: Path) -> str | None:
@@ -36,19 +37,61 @@ def iso_utc_timestamp(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
 
-def build_record(file_path: Path, modality: str, embedding: list[float]) -> dict[str, object]:
+def build_record(file_path: Path, modality: str, embedding: list[float], chunk: int) -> dict[str, object]:
     stat = file_path.stat()
+    resolved_path = file_path.resolve().as_posix()
     return {
         "status": "ok",
-        "path": file_path.resolve().as_posix(),
+        "record_id": f"{resolved_path}#{chunk}",
+        "path": resolved_path,
         "file_name": file_path.name,
         "extension": file_path.suffix.lower(),
         "parent_dir": file_path.parent.resolve().as_posix(),
         "modality": modality,
+        "chunk": chunk,
         "size_bytes": stat.st_size,
         "modified_at": iso_utc_timestamp(stat.st_mtime),
         "embedding": embedding,
     }
+
+
+def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT) -> list[str]:
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_tokens,
+        return_overflowing_tokens=True,
+    )
+    input_ids = encoded["input_ids"]
+    if input_ids and isinstance(input_ids[0], int):
+        input_ids = [input_ids]
+
+    return [
+        chunk
+        for chunk in tokenizer.batch_decode(
+            input_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if chunk.strip()
+    ]
+
+
+def build_text_records(model, file_path: Path, text: str, task: str) -> list[dict[str, object]]:
+    text_chunks = chunk_text(model.processor.tokenizer, text)
+    records: list[dict[str, object]] = []
+
+    for chunk_index, chunk_text_value in enumerate(text_chunks):
+        with torch.inference_mode():
+            embedding = model.encode_text(texts=chunk_text_value, task=task)
+
+        if hasattr(embedding, "detach"):
+            embedding = embedding.detach().cpu().tolist()
+
+        records.append(build_record(file_path, "text", embedding, chunk_index))
+
+    return records
 
 
 def detect_device(requested: str) -> str:
@@ -125,32 +168,32 @@ def main() -> None:
         file_path = Path(raw_line)
 
         try:
-            with torch.inference_mode():
-                if is_image_file(file_path):
+            if is_image_file(file_path):
+                with torch.inference_mode():
                     embedding = model.encode_image(images=file_path.as_posix(), task=args.task)
-                    modality = "image"
-                else:
-                    text = read_text_file(file_path)
-                    if text is None:
-                        print(
-                            json.dumps(
-                                {
-                                    "status": "skipped",
-                                    "path": file_path.resolve().as_posix(),
-                                    "reason": "unsupported_file_type",
-                                }
-                            ),
-                            flush=True,
-                        )
-                        continue
 
-                    embedding = model.encode_text(texts=text, task=args.task)
-                    modality = "text"
+                if hasattr(embedding, "detach"):
+                    embedding = embedding.detach().cpu().tolist()
 
-            if hasattr(embedding, "detach"):
-                embedding = embedding.detach().cpu().tolist()
+                print(json.dumps(build_record(file_path, "image", embedding, 0)), flush=True)
+                continue
 
-            print(json.dumps(build_record(file_path, modality, embedding)), flush=True)
+            text = read_text_file(file_path)
+            if text is None:
+                print(
+                    json.dumps(
+                        {
+                            "status": "skipped",
+                            "path": file_path.resolve().as_posix(),
+                            "reason": "unsupported_file_type",
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
+
+            for record in build_text_records(model, file_path, text, args.task):
+                print(json.dumps(record), flush=True)
         except Exception as exc:
             print(
                 json.dumps(

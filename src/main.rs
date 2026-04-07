@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
-use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::Parser;
 use futures::StreamExt;
@@ -57,11 +57,13 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct WorkerRecord {
     status: String,
+    record_id: Option<String>,
     path: String,
     file_name: Option<String>,
     extension: Option<String>,
     parent_dir: Option<String>,
     modality: Option<String>,
+    chunk: Option<u32>,
     size_bytes: Option<u64>,
     modified_at: Option<String>,
     embedding: Option<Vec<f32>>,
@@ -121,11 +123,13 @@ fn resolve_table_target(db_path: &Path) -> TableTarget {
 
 fn build_schema(embedding_dim: i32) -> SchemaRef {
     Arc::new(Schema::new(vec![
+        Field::new("record_id", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
         Field::new("file_name", DataType::Utf8, false),
         Field::new("extension", DataType::Utf8, false),
         Field::new("parent_dir", DataType::Utf8, false),
         Field::new("modality", DataType::Utf8, false),
+        Field::new("chunk", DataType::UInt32, false),
         Field::new("size_bytes", DataType::UInt64, false),
         Field::new("modified_at", DataType::Utf8, false),
         Field::new(
@@ -141,6 +145,11 @@ fn build_schema(embedding_dim: i32) -> SchemaRef {
 
 fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBatch, Box<dyn std::error::Error>> {
     let schema = build_schema(embedding_dim);
+    let record_ids = StringArray::from_iter_values(
+        records
+            .iter()
+            .map(|record| record.record_id.as_deref().unwrap_or("")),
+    );
     let paths = StringArray::from_iter_values(records.iter().map(|record| record.path.as_str()));
     let file_names = StringArray::from_iter_values(
         records
@@ -162,6 +171,7 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
             .iter()
             .map(|record| record.modality.as_deref().unwrap_or("")),
     );
+    let chunks = UInt32Array::from_iter_values(records.iter().map(|record| record.chunk.unwrap_or(0)));
     let sizes = UInt64Array::from_iter_values(records.iter().map(|record| record.size_bytes.unwrap_or(0)));
     let modified_ats = StringArray::from_iter_values(
         records
@@ -179,11 +189,13 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
     Ok(RecordBatch::try_new(
         schema,
         vec![
+            Arc::new(record_ids) as ArrayRef,
             Arc::new(paths) as ArrayRef,
             Arc::new(file_names),
             Arc::new(extensions),
             Arc::new(parent_dirs),
             Arc::new(modalities),
+            Arc::new(chunks),
             Arc::new(sizes),
             Arc::new(modified_ats),
             Arc::new(embeddings),
@@ -232,7 +244,7 @@ async fn flush_records(
     }
 
     if let Some(existing_table) = table.as_ref() {
-        let mut merge = existing_table.merge_insert(&["path"]);
+        let mut merge = existing_table.merge_insert(&["record_id"]);
         merge
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
