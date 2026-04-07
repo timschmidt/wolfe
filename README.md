@@ -44,7 +44,7 @@ curl -sSfL https://hf.co/git-xet/install.sh | sh
 git clone https://huggingface.co/jinaai/jina-embeddings-v4
 ```
 
-or pass `--model-dir`.
+or pass `--model-dir`
 
 ## Usage
 
