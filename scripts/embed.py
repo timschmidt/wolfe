@@ -1,10 +1,34 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoModel
+from transformers import AutoModel, AutoProcessor
+
+
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+
+
+def read_text_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def is_image_file(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
 def detect_device(requested: str) -> str:
@@ -27,8 +51,7 @@ def detect_device(requested: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Embed a local file using Jina Embeddings V4.")
-    parser.add_argument("--file", required=True, type=Path, help="Path to the input file")
+    parser = argparse.ArgumentParser(description="Embed local files using Jina Embeddings V4.")
     parser.add_argument("--model-dir", required=True, type=Path, help="Path to the local model directory")
     parser.add_argument(
         "--task",
@@ -47,23 +70,53 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    text = args.file.read_text(encoding="utf-8")
     device = detect_device(args.device)
 
     model = AutoModel.from_pretrained(
         args.model_dir.as_posix(),
         trust_remote_code=True,
     )
+    # Jina Embeddings v4 inherits a processor/tokenizer path that needs the Mistral regex fix.
+    model.processor = AutoProcessor.from_pretrained(
+        args.model_dir.as_posix(),
+        trust_remote_code=True,
+        use_fast=True,
+        fix_mistral_regex=True,
+    )
     model.to(device)
     model.eval()
 
-    with torch.inference_mode():
-        embedding = model.encode_text(texts=text, task=args.task)
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
 
-    if hasattr(embedding, "detach"):
-        embedding = embedding.detach().cpu().tolist()
+        file_path = Path(raw_line)
 
-    print(json.dumps(embedding))
+        try:
+            with torch.inference_mode():
+                if is_image_file(file_path):
+                    embedding = model.encode_image(images=file_path.as_posix(), task=args.task)
+                    modality = "image"
+                else:
+                    text = read_text_file(file_path)
+                    if text is None:
+                        continue
+
+                    embedding = model.encode_text(texts=text, task=args.task)
+                    modality = "text"
+
+            if hasattr(embedding, "detach"):
+                embedding = embedding.detach().cpu().tolist()
+
+            response = {
+                "path": file_path.as_posix(),
+                "modality": modality,
+                "embedding": embedding,
+            }
+            print(json.dumps(response), flush=True)
+        except Exception as exc:
+            print(f"{file_path}: {exc}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
