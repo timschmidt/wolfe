@@ -10,8 +10,30 @@ Minimal Rust CLI that embeds a local file using Jina Embeddings V4 by invoking a
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "transformers>=4.52,<5" torchvision torch pillow peft requests
+python -m pip install "transformers>=4.52,<5" pillow peft requests
 ```
+
+Install a PyTorch build that matches your hardware:
+
+- CPU fallback:
+
+```bash
+python -m pip install torch torchvision
+```
+
+- NVIDIA CUDA:
+
+```bash
+python -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+```
+
+- Apple Silicon:
+
+```bash
+python -m pip install torch torchvision
+```
+
+The helper now defaults to `--device auto`, which prefers CUDA, then MPS, then CPU.
 
 ### Ensure model files are present
 
@@ -32,4 +54,10 @@ Optional:
 
 ```bash
 cargo run -- --file /path/to/input.txt --model-dir jina-embeddings-v4 --task retrieval --python python3
+```
+
+To force a device explicitly:
+
+```bash
+cargo run -- --file /path/to/input.txt --device cuda
 ```

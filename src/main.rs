@@ -22,6 +22,10 @@ struct Args {
     #[arg(long, default_value = "python3")]
     python: String,
 
+    /// Execution device: auto, cpu, cuda, or mps
+    #[arg(long, default_value = "auto")]
+    device: String,
+
     /// Path to the embedding helper script
     #[arg(long, default_value = "scripts/embed.py")]
     script: PathBuf,
@@ -38,6 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(&args.model_dir)
         .arg("--task")
         .arg(&args.task)
+        .arg("--device")
+        .arg(&args.device)
         .output()?;
 
     if !output.status.success() {
