@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import sys
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import fitz
 import torch
+from PIL import Image
 from transformers import AutoModel, AutoProcessor
 
 
@@ -19,7 +25,12 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+PDF_EXTENSIONS = {".pdf"}
 TOKEN_CHUNK_LIMIT = 20000
+MIN_TOKEN_CHUNK_LIMIT = 1000
+
+fitz.TOOLS.mupdf_display_errors(False)
+fitz.TOOLS.mupdf_display_warnings(False)
 
 
 def read_text_file(path: Path) -> str | None:
@@ -31,6 +42,10 @@ def read_text_file(path: Path) -> str | None:
 
 def is_image_file(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_pdf_file(path: Path) -> bool:
+    return path.suffix.lower() in PDF_EXTENSIONS
 
 
 def iso_utc_timestamp(epoch_seconds: float) -> str:
@@ -53,6 +68,17 @@ def build_record(file_path: Path, modality: str, embedding: list[float], chunk: 
         "modified_at": iso_utc_timestamp(stat.st_mtime),
         "embedding": embedding,
     }
+
+
+def emit_json(payload: dict[str, object]) -> None:
+    try:
+        print(json.dumps(payload), flush=True)
+    except BrokenPipeError:
+        raise SystemExit(0)
+
+
+def is_cuda_oom(exc: RuntimeError) -> bool:
+    return "CUDA out of memory" in str(exc)
 
 
 def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT) -> list[str]:
@@ -78,18 +104,80 @@ def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT) -> lis
     ]
 
 
+def encode_text_chunks(model, text: str, task: str, max_tokens: int) -> list[list[float]]:
+    text_chunks = chunk_text(model.processor.tokenizer, text, max_tokens=max_tokens)
+    embeddings: list[list[float]] = []
+
+    for chunk_text_value in text_chunks:
+        try:
+            with torch.inference_mode():
+                embedding = model.encode_text(
+                    texts=chunk_text_value,
+                    task=task,
+                    max_length=max_tokens,
+                    batch_size=1,
+                )
+        except RuntimeError as exc:
+            if not is_cuda_oom(exc) or max_tokens <= MIN_TOKEN_CHUNK_LIMIT:
+                raise
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            embeddings.extend(encode_text_chunks(model, chunk_text_value, task, max_tokens // 2))
+            continue
+
+        if hasattr(embedding, "detach"):
+            embedding = embedding.detach().cpu().tolist()
+        embeddings.append(embedding)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return embeddings
+
+
 def build_text_records(model, file_path: Path, text: str, task: str) -> list[dict[str, object]]:
-    text_chunks = chunk_text(model.processor.tokenizer, text)
+    text_embeddings = encode_text_chunks(model, text, task, TOKEN_CHUNK_LIMIT)
     records: list[dict[str, object]] = []
 
-    for chunk_index, chunk_text_value in enumerate(text_chunks):
+    for chunk_index, embedding in enumerate(text_embeddings):
+        records.append(build_record(file_path, "text", embedding, chunk_index))
+
+    return records
+
+
+def extract_pdf_content(file_path: Path) -> tuple[str, list[Image.Image]]:
+    text_parts: list[str] = []
+    page_images: list[Image.Image] = []
+
+    with fitz.open(file_path) as document:
+        for page in document:
+            page_text = page.get_text("text")
+            if page_text:
+                text_parts.append(page_text)
+
+            pixmap = page.get_pixmap(alpha=False)
+            page_image = Image.open(BytesIO(pixmap.tobytes("png"))).convert("RGB")
+            page_images.append(page_image)
+
+    return "".join(text_parts), page_images
+
+
+def build_pdf_records(model, file_path: Path, task: str) -> list[dict[str, object]]:
+    pdf_text, page_images = extract_pdf_content(file_path)
+    records: list[dict[str, object]] = []
+
+    if pdf_text.strip():
+        records.extend(build_text_records(model, file_path, pdf_text, task))
+
+    chunk_offset = len(records)
+    for page_index, page_image in enumerate(page_images):
         with torch.inference_mode():
-            embedding = model.encode_text(texts=chunk_text_value, task=task)
+            embedding = model.encode_image(images=page_image, task=task)
 
         if hasattr(embedding, "detach"):
             embedding = embedding.detach().cpu().tolist()
 
-        records.append(build_record(file_path, "text", embedding, chunk_index))
+        records.append(build_record(file_path, "image", embedding, chunk_offset + page_index))
 
     return records
 
@@ -149,6 +237,10 @@ def main() -> None:
     )
     model.to(device)
     model.eval()
+    if hasattr(model, "verbosity"):
+        model.verbosity = 0
+    if hasattr(model, "model") and hasattr(model.model, "verbosity"):
+        model.model.verbosity = 0
 
     if args.query_text is not None:
         with torch.inference_mode():
@@ -157,7 +249,7 @@ def main() -> None:
         if hasattr(embedding, "detach"):
             embedding = embedding.detach().cpu().tolist()
 
-        print(json.dumps({"status": "query", "embedding": embedding}), flush=True)
+        emit_json({"status": "query", "embedding": embedding})
         return
 
     for raw_line in sys.stdin:
@@ -168,6 +260,11 @@ def main() -> None:
         file_path = Path(raw_line)
 
         try:
+            if is_pdf_file(file_path):
+                for record in build_pdf_records(model, file_path, args.task):
+                    emit_json(record)
+                continue
+
             if is_image_file(file_path):
                 with torch.inference_mode():
                     embedding = model.encode_image(images=file_path.as_posix(), task=args.task)
@@ -175,35 +272,29 @@ def main() -> None:
                 if hasattr(embedding, "detach"):
                     embedding = embedding.detach().cpu().tolist()
 
-                print(json.dumps(build_record(file_path, "image", embedding, 0)), flush=True)
+                emit_json(build_record(file_path, "image", embedding, 0))
                 continue
 
             text = read_text_file(file_path)
             if text is None:
-                print(
-                    json.dumps(
-                        {
-                            "status": "skipped",
-                            "path": file_path.resolve().as_posix(),
-                            "reason": "unsupported_file_type",
-                        }
-                    ),
-                    flush=True,
+                emit_json(
+                    {
+                        "status": "skipped",
+                        "path": file_path.resolve().as_posix(),
+                        "reason": "unsupported_file_type",
+                    }
                 )
                 continue
 
             for record in build_text_records(model, file_path, text, args.task):
-                print(json.dumps(record), flush=True)
+                emit_json(record)
         except Exception as exc:
-            print(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "path": file_path.resolve().as_posix(),
-                        "reason": str(exc),
-                    }
-                ),
-                flush=True,
+            emit_json(
+                {
+                    "status": "error",
+                    "path": file_path.resolve().as_posix(),
+                    "reason": str(exc),
+                }
             )
 
 
