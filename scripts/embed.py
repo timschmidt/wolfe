@@ -257,12 +257,25 @@ def main() -> None:
         if not raw_line:
             continue
 
-        file_path = Path(raw_line)
+        try:
+            request = json.loads(raw_line)
+        except json.JSONDecodeError:
+            request = {"type": "file", "path": raw_line}
+
+        request_type = request.get("type", "file")
+        if request_type == "shutdown":
+            return
+        if request_type != "file":
+            emit_json({"status": "error", "path": "", "reason": f"unsupported request type: {request_type}"})
+            continue
+
+        file_path = Path(request["path"])
 
         try:
             if is_pdf_file(file_path):
                 for record in build_pdf_records(model, file_path, args.task):
                     emit_json(record)
+                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
             if is_image_file(file_path):
@@ -273,6 +286,7 @@ def main() -> None:
                     embedding = embedding.detach().cpu().tolist()
 
                 emit_json(build_record(file_path, "image", embedding, 0))
+                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
             text = read_text_file(file_path)
@@ -284,10 +298,12 @@ def main() -> None:
                         "reason": "unsupported_file_type",
                     }
                 )
+                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
             for record in build_text_records(model, file_path, text, args.task):
                 emit_json(record)
+            emit_json({"status": "done", "path": file_path.resolve().as_posix()})
         except Exception as exc:
             emit_json(
                 {
@@ -296,6 +312,7 @@ def main() -> None:
                     "reason": str(exc),
                 }
             )
+            emit_json({"status": "done", "path": file_path.resolve().as_posix()})
 
 
 if __name__ == "__main__":

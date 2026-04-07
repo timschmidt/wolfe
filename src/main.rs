@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
@@ -11,6 +12,7 @@ use clap::Parser;
 use futures::StreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table, connect};
+use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -52,6 +54,10 @@ struct Args {
     /// Maximum number of search results to return
     #[arg(long, default_value_t = 10)]
     limit: usize,
+
+    /// Watch for changes and keep the index up to date
+    #[arg(long, requires = "path", conflicts_with = "search")]
+    watch: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +83,12 @@ struct QueryRecord {
     reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DoneRecord {
+    status: String,
+    path: String,
+}
+
 #[derive(Debug)]
 enum Mode<'a> {
     Ingest(&'a Path),
@@ -93,6 +105,12 @@ struct Summary {
     stored: usize,
     skipped: usize,
     errors: usize,
+}
+
+struct WorkerSession {
+    child: std::process::Child,
+    writer: BufWriter<std::process::ChildStdin>,
+    reader: BufReader<std::process::ChildStdout>,
 }
 
 fn resolve_table_target(db_path: &Path) -> TableTarget {
@@ -263,6 +281,297 @@ async fn flush_records(
     Ok(flushed)
 }
 
+fn normalize_existing_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if path.exists() {
+        Ok(fs::canonicalize(path)?)
+    } else if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn sql_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn delete_path_records(
+    connection: &Connection,
+    table_name: &str,
+    table: &mut Option<Table>,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if table.is_none() {
+        *table = open_table(connection, table_name).await;
+    }
+
+    if let Some(existing_table) = table.as_ref() {
+        existing_table
+            .delete(&format!("path = {}", sql_quote(path)))
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>> {
+    let mut child = Command::new(&args.python)
+        .arg(&args.script)
+        .arg("--model-dir")
+        .arg(&args.model_dir)
+        .arg("--task")
+        .arg(&args.task)
+        .arg("--device")
+        .arg(&args.device)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    let stdin = child.stdin.take().ok_or("failed to open embedding worker stdin")?;
+    let stdout = child.stdout.take().ok_or("failed to open embedding worker stdout")?;
+
+    Ok(WorkerSession {
+        child,
+        writer: BufWriter::new(stdin),
+        reader: BufReader::new(stdout),
+    })
+}
+
+fn send_worker_file(session: &mut WorkerSession, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let request = json!({
+        "type": "file",
+        "path": path.to_string_lossy(),
+    });
+    writeln!(session.writer, "{request}")?;
+    session.writer.flush()?;
+    Ok(())
+}
+
+fn shutdown_worker(session: &mut WorkerSession) -> Result<(), Box<dyn std::error::Error>> {
+    let request = json!({ "type": "shutdown" });
+    writeln!(session.writer, "{request}")?;
+    session.writer.flush()?;
+    Ok(())
+}
+
+async fn ingest_single_path(
+    session: &mut WorkerSession,
+    connection: &Connection,
+    table_name: &str,
+    table: &mut Option<Table>,
+    path: &Path,
+    embedding_dim: &mut Option<i32>,
+) -> Result<Summary, Box<dyn std::error::Error>> {
+    let normalized_path = normalize_existing_path(path)?;
+    let normalized_path_str = normalized_path.to_string_lossy().to_string();
+    delete_path_records(connection, table_name, table, &normalized_path_str).await?;
+    send_worker_file(session, &normalized_path)?;
+
+    let mut pending = Vec::new();
+    let mut summary = Summary {
+        stored: 0,
+        skipped: 0,
+        errors: 0,
+    };
+
+    loop {
+        let mut line = String::new();
+        if session.reader.read_line(&mut line)? == 0 {
+            return Err("embedding worker exited unexpectedly".into());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let value: serde_json::Value = serde_json::from_str(&line)?;
+        let status = value
+            .get("status")
+            .and_then(|status| status.as_str())
+            .ok_or("worker response missing status")?;
+
+        match status {
+            "ok" => {
+                let record: WorkerRecord = serde_json::from_value(value)?;
+                pending.push(record);
+            }
+            "skipped" => {
+                summary.skipped += 1;
+            }
+            "error" => {
+                let record: WorkerRecord = serde_json::from_value(value)?;
+                summary.errors += 1;
+                let reason = record.reason.unwrap_or_else(|| "unknown error".to_string());
+                eprintln!("{}: {}", record.path, reason);
+            }
+            "done" => {
+                let _: DoneRecord = serde_json::from_value(value)?;
+                break;
+            }
+            other => return Err(format!("unknown worker status: {other}").into()),
+        }
+    }
+
+    summary.stored += flush_records(connection, table_name, table, &mut pending, embedding_dim).await?;
+    Ok(summary)
+}
+
+fn should_ignore_event_path(path: &Path, watched_root: &Path, target_file: Option<&Path>, table_target: &TableTarget) -> bool {
+    if path.starts_with(&table_target.table_path) {
+        return true;
+    }
+    if let Some(target_file) = target_file {
+        return path != target_file;
+    }
+    !path.starts_with(watched_root)
+}
+
+fn classify_event(event: &Event) -> Option<bool> {
+    if event.kind.is_remove() {
+        Some(false)
+    } else if event.kind.is_create() || event.kind.is_modify() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+async fn run_ingest(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+    root_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let files = collect_files(root_path)?;
+    let mut session = start_worker(args)?;
+    let mut table = open_table(connection, &table_target.table_name).await;
+    let mut embedding_dim = None;
+    let mut summary = Summary {
+        stored: 0,
+        skipped: 0,
+        errors: 0,
+    };
+
+    for file in files {
+        let file_summary = ingest_single_path(
+            &mut session,
+            connection,
+            &table_target.table_name,
+            &mut table,
+            &file,
+            &mut embedding_dim,
+        )
+        .await?;
+        summary.stored += file_summary.stored;
+        summary.skipped += file_summary.skipped;
+        summary.errors += file_summary.errors;
+    }
+
+    shutdown_worker(&mut session)?;
+    let status = session.child.wait()?;
+    if !status.success() {
+        return Err("embedding script failed".into());
+    }
+
+    println!(
+        "{}",
+        json!({
+            "db": table_target.table_path.to_string_lossy(),
+            "table": table_target.table_name,
+            "stored": summary.stored,
+            "skipped": summary.skipped,
+            "errors": summary.errors,
+        })
+    );
+
+    Ok(())
+}
+
+async fn run_watch(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+    root_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_ingest(args, connection, table_target, root_path).await?;
+
+    let watch_target = normalize_existing_path(root_path)?;
+    let watched_root = if watch_target.is_dir() {
+        watch_target.clone()
+    } else {
+        watch_target.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    let target_file = if watch_target.is_file() {
+        Some(watch_target.clone())
+    } else {
+        None
+    };
+
+    let mut session = start_worker(args)?;
+    let mut table = open_table(connection, &table_target.table_name).await;
+    let mut embedding_dim = None;
+    let (tx, rx) = channel();
+    let mut watcher = recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })?;
+    watcher.watch(
+        &watched_root,
+        if watch_target.is_dir() {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        },
+    )?;
+
+    loop {
+        match rx.recv() {
+            Ok(Ok(event)) => {
+                let Some(should_index) = classify_event(&event) else {
+                    continue;
+                };
+
+                for path in event.paths {
+                    if should_ignore_event_path(&path, &watched_root, target_file.as_deref(), table_target) {
+                        continue;
+                    }
+
+                    if should_index {
+                        if path.is_file() {
+                            let summary = ingest_single_path(
+                                &mut session,
+                                connection,
+                                &table_target.table_name,
+                                &mut table,
+                                &path,
+                                &mut embedding_dim,
+                            )
+                            .await?;
+                            if summary.errors > 0 {
+                                eprintln!(
+                                    "reindex errors for {}: {}",
+                                    path.display(),
+                                    summary.errors
+                                );
+                            }
+                        }
+                    } else {
+                        let normalized = normalize_existing_path(&path)?;
+                        delete_path_records(
+                            connection,
+                            &table_target.table_name,
+                            &mut table,
+                            &normalized.to_string_lossy(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Ok(Err(err)) => eprintln!("watch error: {err}"),
+            Err(err) => return Err(format!("watch channel closed: {err}").into()),
+        }
+    }
+}
+
 async fn read_query_embedding(
     args: &Args,
     query: &str,
@@ -407,107 +716,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_search(&args, &connection, &table_target, query).await;
     }
 
-    let files = collect_files(match mode {
+    let root_path = match mode {
         Mode::Ingest(path) => path,
         Mode::Search(_) => unreachable!(),
-    })?;
-
-    let mut child = Command::new(&args.python)
-        .arg(&args.script)
-        .arg("--model-dir")
-        .arg(&args.model_dir)
-        .arg("--task")
-        .arg(&args.task)
-        .arg("--device")
-        .arg(&args.device)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-
-    {
-        let stdin = child.stdin.take().ok_or("failed to open embedding worker stdin")?;
-        let mut writer = BufWriter::new(stdin);
-
-        for file in files {
-            writer.write_all(file.to_string_lossy().as_bytes())?;
-            writer.write_all(b"\n")?;
-        }
-
-        writer.flush()?;
-    }
-
-    let mut table = open_table(&connection, &table_target.table_name).await;
-    let mut pending = Vec::new();
-    let mut embedding_dim = None;
-    let mut summary = Summary {
-        stored: 0,
-        skipped: 0,
-        errors: 0,
     };
-    let stdout = child.stdout.take().ok_or("failed to open embedding worker stdout")?;
-    let reader = BufReader::new(stdout);
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let record: WorkerRecord = serde_json::from_str(&line)?;
-        match record.status.as_str() {
-            "ok" => {
-                pending.push(record);
-                if pending.len() >= 64 {
-                    summary.stored += flush_records(
-                        &connection,
-                        &table_target.table_name,
-                        &mut table,
-                        &mut pending,
-                        &mut embedding_dim,
-                    )
-                    .await?;
-                }
-            }
-            "skipped" => {
-                summary.skipped += 1;
-            }
-            "error" => {
-                summary.errors += 1;
-                let reason = record.reason.unwrap_or_else(|| "unknown error".to_string());
-                eprintln!("{}: {}", record.path, reason);
-            }
-            other => {
-                return Err(format!("unknown worker status: {other}").into());
-            }
-        }
+    if args.watch {
+        run_watch(&args, &connection, &table_target, root_path).await
+    } else {
+        run_ingest(&args, &connection, &table_target, root_path).await
     }
-
-    summary.stored += flush_records(
-        &connection,
-        &table_target.table_name,
-        &mut table,
-        &mut pending,
-        &mut embedding_dim,
-    )
-    .await?;
-
-    let status = child.wait()?;
-
-    if !status.success() {
-        return Err("embedding script failed".into());
-    }
-
-    println!(
-        "{}",
-        json!({
-            "db": table_target.table_path.to_string_lossy(),
-            "table": table_target.table_name,
-            "stored": summary.stored,
-            "skipped": summary.skipped,
-            "errors": summary.errors,
-        })
-    );
-
-    Ok(())
 }

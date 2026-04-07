@@ -66,6 +66,12 @@ Search:
 cargo run -- --search "error handling in rust" --db wolfe.lance --limit 10
 ```
 
+Watch for changes:
+
+```bash
+cargo run -- --path /path/to/input-or-directory --watch --db wolfe.lance
+```
+
 To force a device explicitly:
 
 ```bash
@@ -77,6 +83,8 @@ When `--path` points at a directory, the CLI traverses it recursively
 Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `embeddings` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, file size, and modified timestamp so search results can be mapped back to files. UTF-8 text files are embedded as text, common image formats (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are embedded through the model's image path, and PDFs are processed in both ways: embedded text is extracted and chunked first, then each rendered page is embedded as an image with chunk numbers continuing after the text chunks. Text files exceeding 20,000 tokens are chunked locally before embedding, and each chunk is stored as its own row. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
 
 In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Matching file paths and file names are printed to stdout as tab-separated lines.
+
+In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain.
 
 ### Todo
 
