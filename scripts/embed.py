@@ -71,7 +71,7 @@ def detect_device(requested: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Embed local files using Jina Embeddings V4.")
+    parser = argparse.ArgumentParser(description="Embed local files or query text using Jina Embeddings V4.")
     parser.add_argument("--model-dir", required=True, type=Path, help="Path to the local model directory")
     parser.add_argument(
         "--task",
@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "cpu", "cuda", "mps"],
         help="Execution device. Defaults to CUDA, then MPS, then CPU when available.",
     )
+    parser.add_argument("--query-text", help="Query string to embed for semantic search")
     return parser.parse_args()
 
 
@@ -105,6 +106,16 @@ def main() -> None:
     )
     model.to(device)
     model.eval()
+
+    if args.query_text is not None:
+        with torch.inference_mode():
+            embedding = model.encode_text(texts=args.query_text, task=args.task)
+
+        if hasattr(embedding, "detach"):
+            embedding = embedding.detach().cpu().tolist()
+
+        print(json.dumps({"status": "query", "embedding": embedding}), flush=True)
+        return
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()

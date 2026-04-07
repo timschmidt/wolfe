@@ -8,6 +8,8 @@ use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::Parser;
+use futures::StreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table, connect};
 use serde::Deserialize;
 use serde_json::json;
@@ -16,8 +18,12 @@ use serde_json::json;
 #[command(author, version, about)]
 struct Args {
     /// Path to a file or directory to embed recursively
-    #[arg(short, long, value_name = "PATH", alias = "file")]
-    path: PathBuf,
+    #[arg(short, long, value_name = "PATH", alias = "file", conflicts_with = "search")]
+    path: Option<PathBuf>,
+
+    /// Query string to vectorize and search semantically
+    #[arg(long, value_name = "TEXT", conflicts_with = "path")]
+    search: Option<String>,
 
     /// Path to the local model directory
     #[arg(long, default_value = "jina-embeddings-v4")]
@@ -42,6 +48,10 @@ struct Args {
     /// Path to the embedding helper script
     #[arg(long, default_value = "scripts/embed.py")]
     script: PathBuf,
+
+    /// Maximum number of search results to return
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +66,19 @@ struct WorkerRecord {
     modified_at: Option<String>,
     embedding: Option<Vec<f32>>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryRecord {
+    status: String,
+    embedding: Option<Vec<f32>>,
+    reason: Option<String>,
+}
+
+#[derive(Debug)]
+enum Mode<'a> {
+    Ingest(&'a Path),
+    Search(&'a str),
 }
 
 struct TableTarget {
@@ -228,6 +251,93 @@ async fn flush_records(
     Ok(flushed)
 }
 
+async fn read_query_embedding(
+    args: &Args,
+    query: &str,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let mut child = Command::new(&args.python)
+        .arg(&args.script)
+        .arg("--model-dir")
+        .arg(&args.model_dir)
+        .arg("--task")
+        .arg(&args.task)
+        .arg("--device")
+        .arg(&args.device)
+        .arg("--query-text")
+        .arg(query)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    let stdout = child.stdout.take().ok_or("failed to open query worker stdout")?;
+    let reader = BufReader::new(stdout);
+    let mut embedding = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: QueryRecord = serde_json::from_str(&line)?;
+        match record.status.as_str() {
+            "query" => embedding = record.embedding,
+            "error" => {
+                let reason = record.reason.unwrap_or_else(|| "unknown error".to_string());
+                return Err(format!("query embedding failed: {reason}").into());
+            }
+            other => return Err(format!("unknown worker status: {other}").into()),
+        }
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err("query embedding script failed".into());
+    }
+
+    embedding.ok_or_else(|| "query worker did not return an embedding".into())
+}
+
+async fn run_search(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+    query: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table = open_table(connection, &table_target.table_name)
+        .await
+        .ok_or("search table does not exist")?;
+    let query_vector = read_query_embedding(args, query).await?;
+    let mut results = table
+        .vector_search(query_vector)?
+        .limit(args.limit)
+        .execute()
+        .await?;
+
+    while let Some(batch) = results.next().await {
+        let batch = batch?;
+        let paths = batch
+            .column_by_name("path")
+            .ok_or("search result missing path column")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("path column is not Utf8")?;
+        let file_names = batch
+            .column_by_name("file_name")
+            .ok_or("search result missing file_name column")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("file_name column is not Utf8")?;
+
+        for index in 0..batch.num_rows() {
+            let path = paths.value(index);
+            let file_name = file_names.value(index);
+            println!("{path}\t{file_name}");
+        }
+    }
+
+    Ok(())
+}
+
 fn collect_files(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
@@ -265,9 +375,30 @@ fn collect_files_recursive(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let files = collect_files(&args.path)?;
     let table_target = resolve_table_target(&args.db);
-    fs::create_dir_all(&table_target.db_root)?;
+    let mode = match (args.path.as_deref(), args.search.as_deref()) {
+        (Some(path), None) => Mode::Ingest(path),
+        (None, Some(query)) => Mode::Search(query),
+        (Some(_), Some(_)) => return Err("use either --path or --search, not both".into()),
+        (None, None) => return Err("either --path or --search is required".into()),
+    };
+
+    if matches!(mode, Mode::Ingest(_)) {
+        fs::create_dir_all(&table_target.db_root)?;
+    }
+
+    let connection = connect(table_target.db_root.to_string_lossy().as_ref())
+        .execute()
+        .await?;
+
+    if let Mode::Search(query) = mode {
+        return run_search(&args, &connection, &table_target, query).await;
+    }
+
+    let files = collect_files(match mode {
+        Mode::Ingest(path) => path,
+        Mode::Search(_) => unreachable!(),
+    })?;
 
     let mut child = Command::new(&args.python)
         .arg(&args.script)
@@ -294,9 +425,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.flush()?;
     }
 
-    let connection = connect(table_target.db_root.to_string_lossy().as_ref())
-        .execute()
-        .await?;
     let mut table = open_table(&connection, &table_target.table_name).await;
     let mut pending = Vec::new();
     let mut embedding_dim = None;

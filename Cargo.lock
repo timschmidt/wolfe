@@ -5700,6 +5700,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "clap",
+ "futures",
  "lancedb",
  "serde",
  "serde_json",

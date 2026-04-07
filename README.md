@@ -56,6 +56,12 @@ Optional:
 cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 --task retrieval --python python3 --db wolfe.lance
 ```
 
+Search:
+
+```bash
+cargo run -- --search "error handling in rust" --db wolfe.lance --limit 10
+```
+
 To force a device explicitly:
 
 ```bash
@@ -69,3 +75,5 @@ When `--path` points at a directory, the CLI traverses it recursively and writes
 ```
 
 Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `embeddings` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, file size, and modified timestamp so search results can be mapped back to files. UTF-8 text files are embedded as text, and common image formats (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are embedded through the model's image path. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once, but LanceDB persistence now happens on the Rust side.
+
+In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Matching file paths and file names are printed to stdout as tab-separated lines.
