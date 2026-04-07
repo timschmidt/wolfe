@@ -35,7 +35,7 @@ python -m pip install --index-url https://download.pytorch.org/whl/cu128 torch t
 python -m pip install torch torchvision
 ```
 
-The helper now defaults to `--device auto`, which prefers CUDA, then MPS, then CPU.
+The helper defaults to `--device auto`, which prefers CUDA, then MPS, then CPU.
 
 ### Ensure model files are present
 
@@ -70,13 +70,9 @@ To force a device explicitly:
 cargo run -- --path /path/to/input-or-directory --device cuda
 ```
 
-When `--path` points at a directory, the CLI traverses it recursively and writes embeddings into LanceDB from the Rust process:
+When `--path` points at a directory, the CLI traverses it recursively
 
-```json
-{"db":"/abs/path/to/wolfe.lance","table":"wolfe","stored":128,"skipped":4,"errors":0}
-```
-
-Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `embeddings` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, file size, and modified timestamp so search results can be mapped back to files. UTF-8 text files are embedded as text, and common image formats (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are embedded through the model's image path. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once, but LanceDB persistence now happens on the Rust side.
+Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `embeddings` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, file size, and modified timestamp so search results can be mapped back to files. UTF-8 text files are embedded as text, and common image formats (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are embedded through the model's image path. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
 
 In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Matching file paths and file names are printed to stdout as tab-separated lines.
 
