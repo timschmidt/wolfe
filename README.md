@@ -80,7 +80,6 @@ In search mode, the query string is embedded by the same Python model helper and
 
 ### Todo
 
-- implement support for PDFs with/without text stream and zero or more rasterized pages
 - implement support for video files using ffmpeg to render out only keyframes, audio, and CC streams
 - implement database entry removal by metadata search
 - implement inotify (and Win/Mac equivalents) support with --watch flag
