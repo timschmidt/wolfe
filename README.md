@@ -86,3 +86,4 @@ In search mode, the query string is embedded by the same Python model helper and
 - implement database entry removal by metadata search
 - implement inotify (and Win/Mac equivalents) support with --watch flag
 - implement .ignore support for files you don't want indexed
+- implement semantic boundary detection (sliding window?, llm based?)
