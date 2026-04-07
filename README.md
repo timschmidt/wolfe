@@ -6,6 +6,8 @@ For intelligently investigating your files
 
 ## Setup
 
+I would like for Wolfe to be implemented in pure Rust, but currently running the Jina Embeddings V4 model requires the use of a Python wrapper.  Please file a PR or reach out if you know of a way to improve this.  Until then:
+
 ### Create a Python venv and install deps
 
 ```bash
