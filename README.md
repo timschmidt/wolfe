@@ -2,6 +2,8 @@
 
 Multimodal embedding based file indexing and search tool using Jina Embeddings V4
 
+For intelligently investigating your files
+
 ## Setup
 
 ### Create a Python venv and install deps
