@@ -20,6 +20,10 @@ struct Args {
     #[arg(long, default_value = "retrieval")]
     task: String,
 
+    /// Path to the Lance table directory
+    #[arg(long, default_value = "wolfe.lance")]
+    db: PathBuf,
+
     /// Path to the Python interpreter
     #[arg(long, default_value = "python3")]
     python: String,
@@ -77,6 +81,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(&args.model_dir)
         .arg("--task")
         .arg(&args.task)
+        .arg("--db")
+        .arg(&args.db)
         .arg("--device")
         .arg(&args.device)
         .stdin(Stdio::piped())
