@@ -70,6 +70,7 @@ struct WorkerRecord {
     parent_dir: Option<String>,
     modality: Option<String>,
     chunk: Option<u32>,
+    offset: Option<u64>,
     size_bytes: Option<u64>,
     modified_at: Option<String>,
     embedding: Option<Vec<f32>>,
@@ -148,6 +149,7 @@ fn build_schema(embedding_dim: i32) -> SchemaRef {
         Field::new("parent_dir", DataType::Utf8, false),
         Field::new("modality", DataType::Utf8, false),
         Field::new("chunk", DataType::UInt32, false),
+        Field::new("offset", DataType::UInt64, false),
         Field::new("size_bytes", DataType::UInt64, false),
         Field::new("modified_at", DataType::Utf8, false),
         Field::new(
@@ -190,6 +192,7 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
             .map(|record| record.modality.as_deref().unwrap_or("")),
     );
     let chunks = UInt32Array::from_iter_values(records.iter().map(|record| record.chunk.unwrap_or(0)));
+    let offsets = UInt64Array::from_iter_values(records.iter().map(|record| record.offset.unwrap_or(0)));
     let sizes = UInt64Array::from_iter_values(records.iter().map(|record| record.size_bytes.unwrap_or(0)));
     let modified_ats = StringArray::from_iter_values(
         records
@@ -214,6 +217,7 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
             Arc::new(parent_dirs),
             Arc::new(modalities),
             Arc::new(chunks),
+            Arc::new(offsets),
             Arc::new(sizes),
             Arc::new(modified_ats),
             Arc::new(embeddings),

@@ -128,7 +128,13 @@ def iso_utc_timestamp(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
 
-def build_record(file_path: Path, modality: str, embedding: list[float], chunk: int) -> dict[str, object]:
+def build_record(
+    file_path: Path,
+    modality: str,
+    embedding: list[float],
+    chunk: int,
+    offset: int = 0,
+) -> dict[str, object]:
     stat = file_path.stat()
     resolved_path = file_path.resolve().as_posix()
     return {
@@ -140,6 +146,7 @@ def build_record(file_path: Path, modality: str, embedding: list[float], chunk: 
         "parent_dir": file_path.parent.resolve().as_posix(),
         "modality": modality,
         "chunk": chunk,
+        "offset": offset,
         "size_bytes": stat.st_size,
         "modified_at": iso_utc_timestamp(stat.st_mtime),
         "embedding": embedding,
@@ -165,6 +172,14 @@ def offset_record_chunks(records: list[dict[str, object]], chunk_offset: int) ->
         record["chunk"] = int(record["chunk"]) + chunk_offset
         record["record_id"] = f"{record['path']}#{record['chunk']}"
     return records
+
+
+def linear_offsets(count: int, total_units: int) -> list[int]:
+    if count <= 0:
+        return []
+    if total_units <= 0:
+        return [0] * count
+    return [int(i * total_units / count) for i in range(count)]
 
 
 def require_ffmpeg_binary(name: str) -> str:
@@ -249,6 +264,11 @@ def load_audio_waveform(file_path: Path) -> np.ndarray:
     return np.clip(waveform, -1.0, 1.0)
 
 
+def audio_duration_seconds(file_path: Path) -> int:
+    waveform = load_audio_waveform(file_path)
+    return int(len(waveform) / YAMNET_SAMPLE_RATE)
+
+
 def classify_audio_events(media_path: Path, label_name: str) -> tuple[str, list[str]]:
     classifier, class_names = load_audio_classifier()
     waveform = load_audio_waveform(media_path)
@@ -317,7 +337,7 @@ def transcribe_audio(media_path: Path, device: str) -> str:
     return transcript[0].strip() if transcript else ""
 
 
-def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT) -> list[str]:
+def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT, start_char: int = 0) -> list[tuple[str, int]]:
     encoded = tokenizer(
         text,
         add_special_tokens=False,
@@ -329,22 +349,36 @@ def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT) -> lis
     if input_ids and isinstance(input_ids[0], int):
         input_ids = [input_ids]
 
-    return [
-        chunk
-        for chunk in tokenizer.batch_decode(
-            input_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        if chunk.strip()
-    ]
+    decoded_chunks = tokenizer.batch_decode(
+        input_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+    chunks: list[tuple[str, int]] = []
+    search_start = 0
+    for chunk in decoded_chunks:
+        if not chunk.strip():
+            continue
+        relative_start = text.find(chunk, search_start)
+        if relative_start == -1:
+            relative_start = search_start
+        chunks.append((chunk, start_char + relative_start))
+        search_start = relative_start + len(chunk)
+    return chunks
 
 
-def encode_text_chunks(model, text: str, task: str, max_tokens: int) -> list[list[float]]:
-    text_chunks = chunk_text(model.processor.tokenizer, text, max_tokens=max_tokens)
-    embeddings: list[list[float]] = []
+def encode_text_chunks(
+    model,
+    text: str,
+    task: str,
+    max_tokens: int,
+    start_char: int = 0,
+) -> list[tuple[int, list[float]]]:
+    text_chunks = chunk_text(model.processor.tokenizer, text, max_tokens=max_tokens, start_char=start_char)
+    embeddings: list[tuple[int, list[float]]] = []
 
-    for chunk_text_value in text_chunks:
+    for chunk_text_value, chunk_start in text_chunks:
         try:
             with torch.inference_mode():
                 embedding = model.encode_text(
@@ -358,12 +392,20 @@ def encode_text_chunks(model, text: str, task: str, max_tokens: int) -> list[lis
                 raise
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            embeddings.extend(encode_text_chunks(model, chunk_text_value, task, max_tokens // 2))
+            embeddings.extend(
+                encode_text_chunks(
+                    model,
+                    chunk_text_value,
+                    task,
+                    max_tokens // 2,
+                    start_char=chunk_start,
+                )
+            )
             continue
 
         if hasattr(embedding, "detach"):
             embedding = embedding.detach().cpu().tolist()
-        embeddings.append(embedding)
+        embeddings.append((chunk_start, embedding))
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -377,49 +419,59 @@ def build_text_records(
     text: str,
     task: str,
     modality: str = "text",
+    offset_fn=None,
 ) -> list[dict[str, object]]:
     text_embeddings = encode_text_chunks(model, text, task, TOKEN_CHUNK_LIMIT)
     records: list[dict[str, object]] = []
+    if offset_fn is None:
+        offset_fn = lambda char_offset: len(text[:char_offset].encode("utf-8"))
 
-    for chunk_index, embedding in enumerate(text_embeddings):
-        records.append(build_record(file_path, modality, embedding, chunk_index))
+    for chunk_index, (char_offset, embedding) in enumerate(text_embeddings):
+        records.append(build_record(file_path, modality, embedding, chunk_index, offset_fn(char_offset)))
 
     return records
 
 
-def extract_pdf_content(file_path: Path) -> tuple[str, list[Image.Image]]:
-    text_parts: list[str] = []
-    page_images: list[Image.Image] = []
+def extract_pdf_content(file_path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, Image.Image]]]:
+    text_parts: list[tuple[int, str]] = []
+    page_images: list[tuple[int, Image.Image]] = []
 
     with fitz.open(file_path) as document:
-        for page in document:
+        for page_index, page in enumerate(document):
             page_text = page.get_text("text")
             if page_text:
-                text_parts.append(page_text)
+                text_parts.append((page_index, page_text))
 
             pixmap = page.get_pixmap(alpha=False)
             page_image = Image.open(BytesIO(pixmap.tobytes("png"))).convert("RGB")
-            page_images.append(page_image)
+            page_images.append((page_index, page_image))
 
-    return "".join(text_parts), page_images
+    return text_parts, page_images
 
 
 def build_pdf_records(model, file_path: Path, task: str) -> list[dict[str, object]]:
-    pdf_text, page_images = extract_pdf_content(file_path)
+    page_texts, page_images = extract_pdf_content(file_path)
     records: list[dict[str, object]] = []
 
-    if pdf_text.strip():
-        records.extend(build_text_records(model, file_path, pdf_text, task))
+    for page_index, page_text in page_texts:
+        if page_text.strip():
+            page_records = build_text_records(
+                model,
+                file_path,
+                page_text,
+                task,
+                offset_fn=lambda _char_offset, page_index=page_index: page_index,
+            )
+            records.extend(offset_record_chunks(page_records, len(records)))
 
-    chunk_offset = len(records)
-    for page_index, page_image in enumerate(page_images):
+    for page_index, page_image in page_images:
         with torch.inference_mode():
             embedding = model.encode_image(images=page_image, task=task)
 
         if hasattr(embedding, "detach"):
             embedding = embedding.detach().cpu().tolist()
 
-        records.append(build_record(file_path, "image", embedding, chunk_offset + page_index))
+        records.append(build_record(file_path, "image", embedding, len(records), page_index))
 
     return records
 
@@ -433,8 +485,16 @@ def build_audio_records(
     label_name: str | None = None,
 ) -> list[dict[str, object]]:
     media_label = label_name or metadata_path.name
+    duration_seconds = audio_duration_seconds(media_path)
     audio_text, class_names = classify_audio_events(media_path, media_label)
-    records = build_text_records(model, metadata_path, audio_text, task, modality="audio")
+    records = build_text_records(
+        model,
+        metadata_path,
+        audio_text,
+        task,
+        modality="audio",
+        offset_fn=lambda _char_offset: 0,
+    )
 
     if should_transcribe_audio(class_names):
         transcript = transcribe_audio(media_path, device)
@@ -445,10 +505,46 @@ def build_audio_records(
                 f"Audio transcription for {media_label}. {transcript}",
                 task,
                 modality="audio",
+                offset_fn=lambda _char_offset: 0,
             )
-            records.extend(offset_record_chunks(transcript_records, len(records)))
+            transcript_records = offset_record_chunks(transcript_records, len(records))
+            transcript_offsets = linear_offsets(len(transcript_records), duration_seconds)
+            for record, offset in zip(transcript_records, transcript_offsets):
+                record["offset"] = offset
+            records.extend(transcript_records)
+
+    if records:
+        record_offsets = linear_offsets(len(records), duration_seconds)
+        for record, offset in zip(records, record_offsets):
+            record["offset"] = offset
 
     return records
+
+
+def parse_ffprobe_rate(value: str | None) -> float:
+    if not value or value == "0/0":
+        return 0.0
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        denominator_value = float(denominator)
+        if denominator_value == 0:
+            return 0.0
+        return float(numerator) / denominator_value
+    return float(value)
+
+
+def get_video_stream_metadata(video_path: Path) -> dict[str, object]:
+    streams = ffprobe_streams(video_path)
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    if video_stream is None:
+        raise RuntimeError(f"no video stream found in {video_path.name}")
+    return video_stream
+
+
+def time_to_frame_offset(seconds: float, fps: float) -> int:
+    if fps <= 0:
+        return int(seconds)
+    return int(seconds * fps)
 
 
 def ffprobe_streams(file_path: Path) -> list[dict[str, object]]:
@@ -509,14 +605,42 @@ def clean_subtitle_text(raw_text: str) -> str:
     return cleaned.strip()
 
 
-def extract_video_caption_text(video_path: Path, output_dir: Path) -> str:
+def parse_subtitle_cues(raw_text: str) -> list[tuple[float, str]]:
+    blocks = re.split(r"\n\s*\n", raw_text.replace("\r\n", "\n"))
+    cues: list[tuple[float, str]] = []
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if "-->" not in block:
+            continue
+        timing_line_index = 0
+        if "-->" not in lines[0] and len(lines) > 1:
+            timing_line_index = 1
+        timing_line = lines[timing_line_index]
+        match = re.match(
+            r"(?P<start>\d{2}:\d{2}:\d{2}[,.]\d{3})\s+-->\s+(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})",
+            timing_line,
+        )
+        if not match:
+            continue
+        start_text = match.group("start").replace(",", ".")
+        hours, minutes, seconds = start_text.split(":")
+        start_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        content = clean_subtitle_text("\n".join(lines[timing_line_index + 1 :]))
+        if content:
+            cues.append((start_seconds, content))
+    return cues
+
+
+def extract_video_caption_text(video_path: Path, output_dir: Path, fps: float) -> list[tuple[int, str]]:
     streams = ffprobe_streams(video_path)
     subtitle_streams = [stream for stream in streams if stream.get("codec_type") == "subtitle"]
     if not subtitle_streams:
-        return ""
+        return []
 
     ffmpeg_bin = require_ffmpeg_binary("ffmpeg")
-    caption_parts: list[str] = []
+    caption_parts: list[tuple[int, str]] = []
 
     for stream in subtitle_streams:
         stream_index = stream.get("index")
@@ -545,11 +669,41 @@ def extract_video_caption_text(video_path: Path, output_dir: Path) -> str:
         if not subtitle_path.exists():
             continue
 
-        subtitle_text = clean_subtitle_text(subtitle_path.read_text(encoding="utf-8", errors="ignore"))
-        if subtitle_text:
-            caption_parts.append(subtitle_text)
+        subtitle_text = subtitle_path.read_text(encoding="utf-8", errors="ignore")
+        for cue_start_seconds, cue_text in parse_subtitle_cues(subtitle_text):
+            caption_parts.append((time_to_frame_offset(cue_start_seconds, fps), cue_text))
 
-    return "\n".join(caption_parts).strip()
+    return caption_parts
+
+
+def extract_video_keyframe_offsets(video_path: Path, fps: float) -> list[int]:
+    ffprobe_bin = require_ffmpeg_binary("ffprobe")
+    result = run_process(
+        [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-skip_frame",
+            "nokey",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "json",
+            video_path.as_posix(),
+        ],
+        f"ffprobe keyframe scan failed for {video_path.name}",
+    )
+    payload = json.loads(result.stdout or "{}")
+    frames = payload.get("frames", [])
+    offsets: list[int] = []
+    for frame in frames:
+        timestamp = frame.get("best_effort_timestamp_time")
+        if timestamp is None:
+            continue
+        offsets.append(time_to_frame_offset(float(timestamp), fps))
+    return offsets
 
 
 def extract_video_keyframes(video_path: Path, output_dir: Path) -> list[Path]:
@@ -578,18 +732,23 @@ def extract_video_keyframes(video_path: Path, output_dir: Path) -> list[Path]:
 
 def build_video_records(model, file_path: Path, task: str, device: str) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
+    video_stream = get_video_stream_metadata(file_path)
+    fps = parse_ffprobe_rate(
+        str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "0")
+    )
 
     with tempfile.TemporaryDirectory(prefix="wolfe-video-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
 
-        caption_text = extract_video_caption_text(file_path, temp_dir)
-        if caption_text:
+        caption_cues = extract_video_caption_text(file_path, temp_dir, fps)
+        for cue_offset, cue_text in caption_cues:
             caption_records = build_text_records(
                 model,
                 file_path,
-                f"Closed captions for {file_path.name}. {caption_text}",
+                f"Closed captions for {file_path.name}. {cue_text}",
                 task,
                 modality="video_text",
+                offset_fn=lambda _char_offset, cue_offset=cue_offset: cue_offset,
             )
             records.extend(offset_record_chunks(caption_records, len(records)))
 
@@ -604,17 +763,24 @@ def build_video_records(model, file_path: Path, task: str, device: str) -> list[
                 label_name=file_path.name,
             )
             if audio_records:
+                video_duration = float(video_stream.get("duration") or 0.0)
+                total_frames = int(video_duration * fps) if video_duration > 0 and fps > 0 else 0
+                audio_offsets = linear_offsets(len(audio_records), total_frames)
+                for record, offset in zip(audio_records, audio_offsets):
+                    record["offset"] = offset
                 records.extend(offset_record_chunks(audio_records, len(records)))
 
+        keyframe_offsets = extract_video_keyframe_offsets(file_path, fps)
         keyframe_paths = extract_video_keyframes(file_path, temp_dir)
-        for keyframe_path in keyframe_paths:
+        for keyframe_index, keyframe_path in enumerate(keyframe_paths):
             with torch.inference_mode():
                 embedding = model.encode_image(images=keyframe_path.as_posix(), task=task)
 
             if hasattr(embedding, "detach"):
                 embedding = embedding.detach().cpu().tolist()
 
-            records.append(build_record(file_path, "image", embedding, len(records)))
+            frame_offset = keyframe_offsets[keyframe_index] if keyframe_index < len(keyframe_offsets) else keyframe_index
+            records.append(build_record(file_path, "image", embedding, len(records), frame_offset))
 
     return records
 
