@@ -275,29 +275,6 @@ def audio_duration_seconds(file_path: Path) -> int:
     return int(len(waveform) / YAMNET_SAMPLE_RATE)
 
 
-def snippet_from_text(path: Path, byte_offset: int, window_bytes: int = 320) -> str:
-    data = path.read_bytes()
-    if not data:
-        return ""
-    start = min(byte_offset, len(data))
-    end = min(len(data), start + window_bytes)
-    snippet = data[start:end].decode("utf-8", errors="ignore")
-    return normalize_snippet_text(snippet)
-
-
-def transcript_snippet_for_offset(transcript: str, second_offset: int, duration_seconds: int, window_chars: int = 280) -> str:
-    transcript = normalize_snippet_text(transcript)
-    if not transcript:
-        return ""
-    if duration_seconds <= 0:
-        return transcript[:window_chars]
-    ratio = min(max(second_offset / duration_seconds, 0.0), 1.0)
-    center = int(ratio * len(transcript))
-    start = max(0, center - window_chars // 2)
-    end = min(len(transcript), start + window_chars)
-    return transcript[start:end].strip()
-
-
 def classify_audio_events(media_path: Path, label_name: str) -> tuple[str, list[str]]:
     classifier, class_names = load_audio_classifier()
     waveform = load_audio_waveform(media_path)
@@ -714,86 +691,6 @@ def extract_video_caption_text(video_path: Path, output_dir: Path, fps: float) -
     return caption_parts
 
 
-def snippet_from_pdf(path: Path, page_offset: int) -> str:
-    with fitz.open(path) as document:
-        if document.page_count == 0:
-            return ""
-        page_index = min(page_offset, document.page_count - 1)
-        return normalize_snippet_text(document.load_page(page_index).get_text("text"))
-
-
-def snippet_from_video_text(path: Path, frame_offset: int) -> str:
-    video_stream = get_video_stream_metadata(path)
-    fps = parse_ffprobe_rate(str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "0"))
-    with tempfile.TemporaryDirectory(prefix="wolfe-video-snippet-") as temp_dir_name:
-        cues = extract_video_caption_text(path, Path(temp_dir_name), fps)
-    if not cues:
-        return ""
-    selected_text = cues[0][1]
-    for cue_offset, cue_text in cues:
-        if cue_offset <= frame_offset:
-            selected_text = cue_text
-        else:
-            break
-    return normalize_snippet_text(selected_text)
-
-
-def snippet_from_audio(path: Path, device: str, second_offset: int) -> str:
-    transcript = transcribe_audio(path, device)
-    duration = audio_duration_seconds(path)
-    return transcript_snippet_for_offset(transcript, second_offset, duration)
-
-
-def snippet_from_video_audio(path: Path, device: str, frame_offset: int) -> str:
-    video_stream = get_video_stream_metadata(path)
-    fps = parse_ffprobe_rate(str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "0"))
-    second_offset = int(frame_offset / fps) if fps > 0 else int(frame_offset)
-    with tempfile.TemporaryDirectory(prefix="wolfe-video-audio-snippet-") as temp_dir_name:
-        audio_path = extract_video_audio(path, Path(temp_dir_name))
-        if audio_path is None:
-            return ""
-        return snippet_from_audio(audio_path, device, second_offset)
-
-
-def build_snippet_payload(path: Path, modality: str, offset: int, device: str) -> dict[str, object]:
-    extension = path.suffix.lower()
-    snippet = ""
-    unit = "offset"
-
-    if extension == ".pdf":
-        unit = "page"
-        page_number = offset + 1
-        if modality != "image":
-            snippet = snippet_from_pdf(path, offset)
-        return {"status": "snippet", "offset": page_number, "unit": unit, "snippet": snippet}
-
-    if has_video_stream(path):
-        unit = "frame"
-        if modality == "video_text":
-            snippet = snippet_from_video_text(path, offset)
-        elif modality == "audio":
-            snippet = snippet_from_video_audio(path, device, offset)
-        return {"status": "snippet", "offset": offset, "unit": unit, "snippet": snippet}
-
-    if is_audio_file(path):
-        unit = "second"
-        snippet = snippet_from_audio(path, device, offset)
-        return {"status": "snippet", "offset": offset, "unit": unit, "snippet": snippet}
-
-    if modality == "text":
-        unit = "byte"
-        snippet = snippet_from_text(path, offset)
-        return {"status": "snippet", "offset": offset, "unit": unit, "snippet": snippet}
-
-    if modality == "image":
-        return {"status": "snippet", "offset": offset, "unit": unit, "snippet": ""}
-
-    if path.exists():
-        snippet = snippet_from_text(path, offset)
-        unit = "byte"
-    return {"status": "snippet", "offset": offset, "unit": unit, "snippet": snippet}
-
-
 def extract_video_keyframe_offsets(video_path: Path, fps: float) -> list[int]:
     ffprobe_bin = require_ffmpeg_binary("ffprobe")
     result = run_process(
@@ -938,28 +835,12 @@ def parse_args() -> argparse.Namespace:
         help="Execution device. Defaults to CUDA, then MPS, then CPU when available.",
     )
     parser.add_argument("--query-text", help="Query string to embed for semantic search")
-    parser.add_argument("--snippet-path", type=Path, help="Path to a file for snippet lookup")
-    parser.add_argument("--snippet-modality", help="Stored modality for snippet lookup")
-    parser.add_argument("--snippet-offset", type=int, help="Stored offset for snippet lookup")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     device = detect_device(args.device)
-
-    if args.snippet_path is not None:
-        if args.snippet_modality is None or args.snippet_offset is None:
-            raise RuntimeError("--snippet-path requires --snippet-modality and --snippet-offset")
-        emit_json(
-            build_snippet_payload(
-                args.snippet_path,
-                args.snippet_modality,
-                args.snippet_offset,
-                device,
-            )
-        )
-        return
 
     model = AutoModel.from_pretrained(
         args.model_dir.as_posix(),
