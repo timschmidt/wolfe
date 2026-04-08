@@ -18,7 +18,7 @@ import torch
 import tensorflow as tf
 import tensorflow_hub as hub
 from PIL import Image
-from transformers import AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from transformers import AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor
 
 
 IMAGE_EXTENSIONS = {
@@ -74,7 +74,8 @@ fitz.TOOLS.mupdf_display_warnings(False)
 
 _AUDIO_CLASSIFIER = None
 _AUDIO_CLASS_NAMES = None
-_WHISPER_PIPE = None
+_WHISPER_MODEL = None
+_WHISPER_PROCESSOR = None
 
 
 def read_text_file(path: Path) -> str | None:
@@ -146,36 +147,24 @@ def load_audio_classifier():
     return _AUDIO_CLASSIFIER, _AUDIO_CLASS_NAMES
 
 
-def load_whisper_pipeline(device: str):
-    global _WHISPER_PIPE
-    if _WHISPER_PIPE is not None:
-        return _WHISPER_PIPE
+def load_whisper_model(device: str):
+    global _WHISPER_MODEL, _WHISPER_PROCESSOR
+    if _WHISPER_MODEL is not None and _WHISPER_PROCESSOR is not None:
+        return _WHISPER_MODEL, _WHISPER_PROCESSOR
 
-    torch_dtype = torch.float16 if device == "cuda" else torch.float32
+    model_dtype = torch.float16 if device == "cuda" else torch.float32
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         WHISPER_MODEL_ID,
-        torch_dtype=torch_dtype,
+        dtype=model_dtype,
         use_safetensors=True,
     )
     model.to(device)
+    model.eval()
     processor = AutoProcessor.from_pretrained(WHISPER_MODEL_ID)
-    pipe_device = device
-    if device == "cuda":
-        pipe_device = 0
-    elif device == "cpu":
-        pipe_device = -1
 
-    _WHISPER_PIPE = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        chunk_length_s=30,
-        batch_size=1,
-        torch_dtype=torch_dtype,
-        device=pipe_device,
-    )
-    return _WHISPER_PIPE
+    _WHISPER_MODEL = model
+    _WHISPER_PROCESSOR = processor
+    return _WHISPER_MODEL, _WHISPER_PROCESSOR
 
 
 def ensure_sample_rate(original_sample_rate: int, waveform: np.ndarray) -> np.ndarray:
@@ -237,11 +226,36 @@ def should_transcribe_audio(class_names: list[str]) -> bool:
 
 
 def transcribe_audio(file_path: Path, device: str) -> str:
-    whisper_pipe = load_whisper_pipeline(device)
-    result = whisper_pipe(str(file_path), return_timestamps=False)
-    if isinstance(result, dict):
-        return result.get("text", "").strip()
-    return ""
+    whisper_model, whisper_processor = load_whisper_model(device)
+    waveform = load_audio_waveform(file_path)
+    inputs = whisper_processor(
+        audio=waveform,
+        sampling_rate=YAMNET_SAMPLE_RATE,
+        return_tensors="pt",
+        return_attention_mask=True,
+    )
+
+    input_features = inputs["input_features"].to(device=device, dtype=whisper_model.dtype)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+    with torch.inference_mode():
+        generated_ids = whisper_model.generate(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            task="transcribe",
+            return_timestamps=False,
+        )
+
+    transcript = whisper_processor.tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return transcript[0].strip() if transcript else ""
 
 
 def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT) -> list[str]:

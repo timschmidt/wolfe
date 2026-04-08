@@ -28,7 +28,7 @@ python -m pip install torch torchvision
 - NVIDIA CUDA:
 
 ```bash
-python -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+python -m pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 - Apple Silicon:
