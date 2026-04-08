@@ -55,6 +55,10 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     limit: usize,
 
+    /// Include snippet/locator data with search results
+    #[arg(long, requires = "search", conflicts_with = "path")]
+    snippet: bool,
+
     /// Watch for changes and keep the index up to date
     #[arg(long, requires = "path", conflicts_with = "search")]
     watch: bool,
@@ -81,6 +85,15 @@ struct WorkerRecord {
 struct QueryRecord {
     status: String,
     embedding: Option<Vec<f32>>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnippetRecord {
+    status: String,
+    offset: Option<u64>,
+    unit: Option<String>,
+    snippet: Option<String>,
     reason: Option<String>,
 }
 
@@ -622,6 +635,56 @@ async fn read_query_embedding(
     embedding.ok_or_else(|| "query worker did not return an embedding".into())
 }
 
+async fn read_search_snippet(
+    args: &Args,
+    path: &str,
+    modality: &str,
+    offset: u64,
+) -> Result<SnippetRecord, Box<dyn std::error::Error>> {
+    let mut child = Command::new(&args.python)
+        .arg(&args.script)
+        .arg("--model-dir")
+        .arg(&args.model_dir)
+        .arg("--device")
+        .arg(&args.device)
+        .arg("--snippet-path")
+        .arg(path)
+        .arg("--snippet-modality")
+        .arg(modality)
+        .arg("--snippet-offset")
+        .arg(offset.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    let stdout = child.stdout.take().ok_or("failed to open snippet worker stdout")?;
+    let reader = BufReader::new(stdout);
+    let mut result = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: SnippetRecord = serde_json::from_str(&line)?;
+        match record.status.as_str() {
+            "snippet" => result = Some(record),
+            "error" => {
+                let reason = record.reason.unwrap_or_else(|| "unknown error".to_string());
+                return Err(format!("snippet lookup failed: {reason}").into());
+            }
+            other => return Err(format!("unknown worker status: {other}").into()),
+        }
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err("snippet worker script failed".into());
+    }
+
+    result.ok_or_else(|| "snippet worker did not return a snippet".into())
+}
+
 async fn run_search(
     args: &Args,
     connection: &Connection,
@@ -652,11 +715,35 @@ async fn run_search(
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or("file_name column is not Utf8")?;
+        let modalities = batch
+            .column_by_name("modality")
+            .ok_or("search result missing modality column")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("modality column is not Utf8")?;
+        let offsets = batch
+            .column_by_name("offset")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>());
 
         for index in 0..batch.num_rows() {
             let path = paths.value(index);
             let file_name = file_names.value(index);
-            println!("{path}\t{file_name}");
+            if !args.snippet {
+                println!("{path}\t{file_name}");
+                continue;
+            }
+
+            let modality = modalities.value(index);
+            let offset = offsets.map(|array| array.value(index)).unwrap_or(0);
+            let snippet = read_search_snippet(args, path, modality, offset).await?;
+            let unit = snippet.unit.unwrap_or_else(|| "offset".to_string());
+            let resolved_offset = snippet.offset.unwrap_or(offset);
+            let snippet_text = snippet
+                .snippet
+                .unwrap_or_default()
+                .replace('\t', " ")
+                .replace('\n', " ");
+            println!("{path}\t{file_name}\t{modality}\t{unit}:{resolved_offset}\t{snippet_text}");
         }
     }
 

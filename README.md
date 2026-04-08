@@ -86,6 +86,8 @@ Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`,
 
 In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Matching file paths and file names are printed to stdout as tab-separated lines.
 
+When `--snippet` is passed with `--search`, Wolfe prints additional tab-separated columns for the matched modality, the stored locator (`byte`, `second`, `page`, or `frame`), and a best-effort snippet. Plain text snippets are read from the source file at the stored byte offset, PDFs return page text when available, video caption matches return the closest caption text, and audio-derived matches return an approximate transcript snippet centered around the stored second or frame offset.
+
 In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain.
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
@@ -96,4 +98,3 @@ Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 - implement inotify (and Win/Mac equivalents) support with --watch flag
 - implement .ignore support for files you don't want indexed
 - implement semantic boundary detection (sliding window?, llm based?)
-- implement flag to show matching snippet for the search result items
