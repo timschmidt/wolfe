@@ -138,6 +138,7 @@ def build_record(
     embedding: list[float],
     chunk: int,
     offset: int = 0,
+    plaintext: str = "",
 ) -> dict[str, object]:
     stat = file_path.stat()
     resolved_path = file_path.resolve().as_posix()
@@ -151,6 +152,7 @@ def build_record(
         "modality": modality,
         "chunk": chunk,
         "offset": offset,
+        "plaintext": plaintext,
         "size_bytes": stat.st_size,
         "modified_at": iso_utc_timestamp(stat.st_mtime),
         "embedding": embedding,
@@ -401,9 +403,9 @@ def encode_text_chunks(
     task: str,
     max_tokens: int,
     start_char: int = 0,
-) -> list[tuple[int, list[float]]]:
+) -> list[tuple[int, str, list[float]]]:
     text_chunks = chunk_text(model.processor.tokenizer, text, max_tokens=max_tokens, start_char=start_char)
-    embeddings: list[tuple[int, list[float]]] = []
+    embeddings: list[tuple[int, str, list[float]]] = []
 
     for chunk_text_value, chunk_start in text_chunks:
         try:
@@ -432,7 +434,7 @@ def encode_text_chunks(
 
         if hasattr(embedding, "detach"):
             embedding = embedding.detach().cpu().tolist()
-        embeddings.append((chunk_start, embedding))
+        embeddings.append((chunk_start, chunk_text_value, embedding))
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -453,8 +455,17 @@ def build_text_records(
     if offset_fn is None:
         offset_fn = lambda char_offset: len(text[:char_offset].encode("utf-8"))
 
-    for chunk_index, (char_offset, embedding) in enumerate(text_embeddings):
-        records.append(build_record(file_path, modality, embedding, chunk_index, offset_fn(char_offset)))
+    for chunk_index, (char_offset, chunk_text_value, embedding) in enumerate(text_embeddings):
+        records.append(
+            build_record(
+                file_path,
+                modality,
+                embedding,
+                chunk_index,
+                offset_fn(char_offset),
+                normalize_snippet_text(chunk_text_value),
+            )
+        )
 
     return records
 
