@@ -3,7 +3,11 @@ import argparse
 import csv
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -40,6 +44,17 @@ AUDIO_EXTENSIONS = {
     ".ogg",
     ".opus",
     ".wav",
+    ".webm",
+}
+VIDEO_EXTENSIONS = {
+    ".avi",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".ts",
     ".webm",
 }
 TOKEN_CHUNK_LIMIT = 20000
@@ -97,6 +112,18 @@ def is_audio_file(path: Path) -> bool:
     return path.suffix.lower() in AUDIO_EXTENSIONS
 
 
+def is_video_file(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def has_video_stream(path: Path) -> bool:
+    try:
+        streams = ffprobe_streams(path)
+    except RuntimeError:
+        return False
+    return any(stream.get("codec_type") == "video" for stream in streams)
+
+
 def iso_utc_timestamp(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
@@ -128,6 +155,38 @@ def emit_json(payload: dict[str, object]) -> None:
 
 def is_cuda_oom(exc: RuntimeError) -> bool:
     return "CUDA out of memory" in str(exc)
+
+
+def offset_record_chunks(records: list[dict[str, object]], chunk_offset: int) -> list[dict[str, object]]:
+    if chunk_offset == 0:
+        return records
+
+    for record in records:
+        record["chunk"] = int(record["chunk"]) + chunk_offset
+        record["record_id"] = f"{record['path']}#{record['chunk']}"
+    return records
+
+
+def require_ffmpeg_binary(name: str) -> str:
+    binary = shutil.which(name)
+    if binary is None:
+        raise RuntimeError(f"{name} is required for video ingestion but was not found in PATH")
+    return binary
+
+
+def run_process(command: list[str], failure_message: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip()
+        if stderr:
+            raise RuntimeError(f"{failure_message}: {stderr}") from exc
+        raise RuntimeError(failure_message) from exc
 
 
 def load_audio_classifier():
@@ -190,9 +249,9 @@ def load_audio_waveform(file_path: Path) -> np.ndarray:
     return np.clip(waveform, -1.0, 1.0)
 
 
-def classify_audio_events(file_path: Path) -> tuple[str, list[str]]:
+def classify_audio_events(media_path: Path, label_name: str) -> tuple[str, list[str]]:
     classifier, class_names = load_audio_classifier()
-    waveform = load_audio_waveform(file_path)
+    waveform = load_audio_waveform(media_path)
     scores, _, _ = classifier(waveform)
     scores_np = scores.numpy()
 
@@ -210,7 +269,7 @@ def classify_audio_events(file_path: Path) -> tuple[str, list[str]]:
             break
 
     summary = (
-        f"Audio event summary for {file_path.name}. "
+        f"Audio event summary for {label_name}. "
         f"Top classes: {', '.join(top_class_names)}. "
         f"Detected frame events: {', '.join(frame_class_names)}."
     )
@@ -225,9 +284,9 @@ def should_transcribe_audio(class_names: list[str]) -> bool:
     )
 
 
-def transcribe_audio(file_path: Path, device: str) -> str:
+def transcribe_audio(media_path: Path, device: str) -> str:
     whisper_model, whisper_processor = load_whisper_model(device)
-    waveform = load_audio_waveform(file_path)
+    waveform = load_audio_waveform(media_path)
     inputs = whisper_processor(
         audio=waveform,
         sampling_rate=YAMNET_SAMPLE_RATE,
@@ -365,25 +424,197 @@ def build_pdf_records(model, file_path: Path, task: str) -> list[dict[str, objec
     return records
 
 
-def build_audio_records(model, file_path: Path, task: str, device: str) -> list[dict[str, object]]:
-    audio_text, class_names = classify_audio_events(file_path)
-    records = build_text_records(model, file_path, audio_text, task, modality="audio")
+def build_audio_records(
+    model,
+    media_path: Path,
+    metadata_path: Path,
+    task: str,
+    device: str,
+    label_name: str | None = None,
+) -> list[dict[str, object]]:
+    media_label = label_name or metadata_path.name
+    audio_text, class_names = classify_audio_events(media_path, media_label)
+    records = build_text_records(model, metadata_path, audio_text, task, modality="audio")
 
     if should_transcribe_audio(class_names):
-        transcript = transcribe_audio(file_path, device)
+        transcript = transcribe_audio(media_path, device)
         if transcript:
             transcript_records = build_text_records(
                 model,
-                file_path,
-                f"Audio transcription for {file_path.name}. {transcript}",
+                metadata_path,
+                f"Audio transcription for {media_label}. {transcript}",
                 task,
                 modality="audio",
             )
-            chunk_offset = len(records)
-            for record in transcript_records:
-                record["chunk"] = int(record["chunk"]) + chunk_offset
-                record["record_id"] = f"{record['path']}#{record['chunk']}"
-            records.extend(transcript_records)
+            records.extend(offset_record_chunks(transcript_records, len(records)))
+
+    return records
+
+
+def ffprobe_streams(file_path: Path) -> list[dict[str, object]]:
+    ffprobe_bin = require_ffmpeg_binary("ffprobe")
+    result = run_process(
+        [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_streams",
+            "-of",
+            "json",
+            file_path.as_posix(),
+        ],
+        f"ffprobe failed for {file_path.name}",
+    )
+    payload = json.loads(result.stdout or "{}")
+    return payload.get("streams", [])
+
+
+def extract_video_audio(video_path: Path, output_dir: Path) -> Path | None:
+    ffmpeg_bin = require_ffmpeg_binary("ffmpeg")
+    audio_path = output_dir / "audio.wav"
+    try:
+        run_process(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                video_path.as_posix(),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(YAMNET_SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                audio_path.as_posix(),
+            ],
+            f"ffmpeg audio extraction failed for {video_path.name}",
+        )
+    except RuntimeError:
+        return None
+
+    return audio_path if audio_path.exists() and audio_path.stat().st_size > 0 else None
+
+
+def clean_subtitle_text(raw_text: str) -> str:
+    cleaned = raw_text.replace("\r\n", "\n")
+    cleaned = re.sub(r"\d+\n\d{2}:\d{2}:\d{2}[,.]\d{3} --> .*?(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"\d{2}:\d{2}:\d{2}[,.]\d{3} --> .*?(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\{[^}]+\}", " ", cleaned)
+    cleaned = re.sub(r"\[[^\]]+\]", " ", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+    return cleaned.strip()
+
+
+def extract_video_caption_text(video_path: Path, output_dir: Path) -> str:
+    streams = ffprobe_streams(video_path)
+    subtitle_streams = [stream for stream in streams if stream.get("codec_type") == "subtitle"]
+    if not subtitle_streams:
+        return ""
+
+    ffmpeg_bin = require_ffmpeg_binary("ffmpeg")
+    caption_parts: list[str] = []
+
+    for stream in subtitle_streams:
+        stream_index = stream.get("index")
+        if stream_index is None:
+            continue
+
+        subtitle_path = output_dir / f"subtitle-{stream_index}.vtt"
+        try:
+            run_process(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    video_path.as_posix(),
+                    "-map",
+                    f"0:{stream_index}",
+                    subtitle_path.as_posix(),
+                ],
+                f"ffmpeg subtitle extraction failed for {video_path.name}",
+            )
+        except RuntimeError:
+            continue
+
+        if not subtitle_path.exists():
+            continue
+
+        subtitle_text = clean_subtitle_text(subtitle_path.read_text(encoding="utf-8", errors="ignore"))
+        if subtitle_text:
+            caption_parts.append(subtitle_text)
+
+    return "\n".join(caption_parts).strip()
+
+
+def extract_video_keyframes(video_path: Path, output_dir: Path) -> list[Path]:
+    ffmpeg_bin = require_ffmpeg_binary("ffmpeg")
+    pattern = output_dir / "frame-%06d.jpg"
+    run_process(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-v",
+            "error",
+            "-skip_frame",
+            "nokey",
+            "-i",
+            video_path.as_posix(),
+            "-vf",
+            "scale=1280:-2:force_original_aspect_ratio=decrease",
+            "-fps_mode",
+            "vfr",
+            pattern.as_posix(),
+        ],
+        f"ffmpeg keyframe extraction failed for {video_path.name}",
+    )
+    return sorted(output_dir.glob("frame-*.jpg"))
+
+
+def build_video_records(model, file_path: Path, task: str, device: str) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+
+    with tempfile.TemporaryDirectory(prefix="wolfe-video-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+
+        caption_text = extract_video_caption_text(file_path, temp_dir)
+        if caption_text:
+            caption_records = build_text_records(
+                model,
+                file_path,
+                f"Closed captions for {file_path.name}. {caption_text}",
+                task,
+                modality="video_text",
+            )
+            records.extend(offset_record_chunks(caption_records, len(records)))
+
+        audio_path = extract_video_audio(file_path, temp_dir)
+        if audio_path is not None:
+            audio_records = build_audio_records(
+                model,
+                audio_path,
+                file_path,
+                task,
+                device,
+                label_name=file_path.name,
+            )
+            if audio_records:
+                records.extend(offset_record_chunks(audio_records, len(records)))
+
+        keyframe_paths = extract_video_keyframes(file_path, temp_dir)
+        for keyframe_path in keyframe_paths:
+            with torch.inference_mode():
+                embedding = model.encode_image(images=keyframe_path.as_posix(), task=task)
+
+            if hasattr(embedding, "detach"):
+                embedding = embedding.detach().cpu().tolist()
+
+            records.append(build_record(file_path, "image", embedding, len(records)))
 
     return records
 
@@ -478,6 +709,12 @@ def main() -> None:
         file_path = Path(request["path"])
 
         try:
+            if is_video_file(file_path) and has_video_stream(file_path):
+                for record in build_video_records(model, file_path, args.task, device):
+                    emit_json(record)
+                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
+                continue
+
             if is_pdf_file(file_path):
                 for record in build_pdf_records(model, file_path, args.task):
                     emit_json(record)
@@ -485,7 +722,7 @@ def main() -> None:
                 continue
 
             if is_audio_file(file_path):
-                for record in build_audio_records(model, file_path, args.task, device):
+                for record in build_audio_records(model, file_path, file_path, args.task, device):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
