@@ -1,6 +1,6 @@
 # Wolfe
 
-Multimodal semantic file search using Jina Embeddings V4
+Multimodal semantic file search using Jina Embeddings V4, YAMNet, and Whisper Large V3
 
 For intelligently investigating your files
 
@@ -11,10 +11,10 @@ I would like for Wolfe to be implemented in pure Rust, but currently running the
 ### Create a Python venv and install deps
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "transformers>=4.52,<5" pillow peft requests pymupdf
+python -m pip install "transformers>=4.52,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub
 ```
 
 Install a PyTorch build that matches your hardware:
@@ -80,7 +80,7 @@ cargo run -- --path /path/to/input-or-directory --device cuda
 
 When `--path` points at a directory, the CLI traverses it recursively
 
-Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `wolfe` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, file size, and modified timestamp so search results can be mapped back to files. UTF-8 text files are embedded as text, common image formats (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are embedded through the model's image path, and PDFs are processed in both ways: embedded text is extracted and chunked first, then each rendered page is embedded as an image with chunk numbers continuing after the text chunks. Text files exceeding 20,000 tokens are chunked locally before embedding, and each chunk is stored as its own row. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
+Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `wolfe` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, file size, and modified timestamp so search results can be mapped back to files. UTF-8 text files are embedded as text, common image formats (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are embedded through the model's image path, PDFs are processed in both ways: embedded text is extracted and chunked first, then each rendered page is embedded as an image with chunk numbers continuing after the text chunks, and common audio formats (`.wav`, `.mp3`, `.flac`, `.ogg`, `.opus`, `.m4a`, `.aac`, `.webm`) are classified with YAMNet and embedded as text summaries of detected audio events. If YAMNet indicates speech or related vocalization categories, Wolfe also runs Whisper large-v3 and stores chunked embeddings of the transcription after the event-summary chunks. Text files exceeding 20,000 tokens are chunked locally before embedding, and each chunk is stored as its own row. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
 
 In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Matching file paths and file names are printed to stdout as tab-separated lines.
 
