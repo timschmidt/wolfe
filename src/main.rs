@@ -830,10 +830,8 @@ async fn run_search(
                 global_index += 1;
                 continue;
             }
-            if let Some(end) = range_end {
-                if global_index >= end {
-                    return Ok(());
-                }
+            if let Some(end) = range_end && global_index >= end {
+                return Ok(());
             }
             let path = paths.value(index);
             let file_name = file_names.value(index);
@@ -845,8 +843,7 @@ async fn run_search(
             let snippet_text = plaintexts
                 .map(|array| array.value(index))
                 .unwrap_or("")
-                .replace('\t', " ")
-                .replace('\n', " ");
+                .replace(['\t', '\n'], " ");
             if args.json {
                 json_rows.push(json!({
                     "path": path,
