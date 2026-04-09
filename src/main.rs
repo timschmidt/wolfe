@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     limit: usize,
 
+    /// Return search results as JSON
+    #[arg(long)]
+    json: bool,
+
     /// Range of search results to return, formatted as START:END (0-based, end-exclusive)
     #[arg(long, value_name = "START:END")]
     range: Option<String>,
@@ -787,6 +791,7 @@ async fn run_search(
         .await?;
 
     let mut global_index = 0usize;
+    let mut json_rows: Vec<serde_json::Value> = Vec::new();
     while let Some(batch) = results.next().await {
         let batch = batch?;
         let paths = batch
@@ -842,9 +847,24 @@ async fn run_search(
                 .unwrap_or("")
                 .replace('\t', " ")
                 .replace('\n', " ");
-            println!("{path}\t{file_name}\t{modality}\t{unit}:{resolved_offset}\t{snippet_text}");
+            if args.json {
+                json_rows.push(json!({
+                    "path": path,
+                    "file_name": file_name,
+                    "modality": modality,
+                    "unit": unit,
+                    "offset": resolved_offset,
+                    "snippet": snippet_text,
+                }));
+            } else {
+                println!("{path}\t{file_name}\t{modality}\t{unit}:{resolved_offset}\t{snippet_text}");
+            }
             global_index += 1;
         }
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string(&json_rows)?);
     }
 
     Ok(())
