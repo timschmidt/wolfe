@@ -94,6 +94,4 @@ Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
 ### Todo
 
-- implement database entry removal by metadata search
-- implement inotify (and Win/Mac equivalents) support with --watch flag
 - implement semantic boundary detection (sliding window?, llm based?)
