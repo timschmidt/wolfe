@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     limit: usize,
 
+    /// Range of search results to return, formatted as START:END (0-based, end-exclusive)
+    #[arg(long, value_name = "START:END")]
+    range: Option<String>,
+
     /// File or directory names or paths to ignore during ingest and watch
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     ignore: Vec<PathBuf>,
@@ -116,6 +120,28 @@ struct Summary {
     stored: usize,
     skipped: usize,
     errors: usize,
+}
+
+fn parse_range(value: &str) -> Result<(usize, usize), String> {
+    let trimmed = value.trim();
+    let (start_str, end_str) = trimmed
+        .split_once(':')
+        .ok_or_else(|| "range must be formatted as START:END".to_string())?;
+    if start_str.trim().is_empty() || end_str.trim().is_empty() {
+        return Err("range must be formatted as START:END".to_string());
+    }
+    let start = start_str
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "range START must be a non-negative integer".to_string())?;
+    let end = end_str
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "range END must be a non-negative integer".to_string())?;
+    if end <= start {
+        return Err("range END must be greater than START".to_string());
+    }
+    Ok((start, end))
 }
 
 struct WorkerSession {
@@ -742,16 +768,25 @@ async fn run_search(
     table_target: &TableTarget,
     query: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (range_start, range_end) = if let Some(range_value) = args.range.as_deref() {
+        let (start, end) = parse_range(range_value).map_err(|err| format!("invalid --range: {err}"))?;
+        (start, Some(end))
+    } else {
+        (0, None)
+    };
+    let effective_limit = range_end.unwrap_or(args.limit);
+
     let table = open_table(connection, &table_target.table_name)
         .await
         .ok_or("search table does not exist")?;
     let query_vector = read_query_embedding(args, query).await?;
     let mut results = table
         .vector_search(query_vector)?
-        .limit(args.limit)
+        .limit(effective_limit)
         .execute()
         .await?;
 
+    let mut global_index = 0usize;
     while let Some(batch) = results.next().await {
         let batch = batch?;
         let paths = batch
@@ -786,6 +821,15 @@ async fn run_search(
             .and_then(|column| column.as_any().downcast_ref::<StringArray>());
 
         for index in 0..batch.num_rows() {
+            if global_index < range_start {
+                global_index += 1;
+                continue;
+            }
+            if let Some(end) = range_end {
+                if global_index >= end {
+                    return Ok(());
+                }
+            }
             let path = paths.value(index);
             let file_name = file_names.value(index);
             let modality = modalities.value(index);
@@ -799,6 +843,7 @@ async fn run_search(
                 .replace('\t', " ")
                 .replace('\n', " ");
             println!("{path}\t{file_name}\t{modality}\t{unit}:{resolved_offset}\t{snippet_text}");
+            global_index += 1;
         }
     }
 
