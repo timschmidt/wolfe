@@ -310,7 +310,21 @@ def should_transcribe_audio(class_names: list[str]) -> bool:
     )
 
 
-def transcribe_audio(media_path: Path, device: str) -> str:
+def detect_whisper_language(tokenizer, generated_ids: torch.Tensor) -> str | None:
+    if generated_ids is None:
+        return None
+    lang_to_id = getattr(tokenizer, "lang_to_id", None)
+    if not isinstance(lang_to_id, dict):
+        return None
+    id_to_lang = {value: key for key, value in lang_to_id.items()}
+    ids = generated_ids[0].tolist() if generated_ids.ndim > 1 else generated_ids.tolist()
+    for token_id in ids:
+        if token_id in id_to_lang:
+            return id_to_lang[token_id]
+    return None
+
+
+def transcribe_audio(media_path: Path, device: str, language: str | None = None) -> tuple[str, str | None]:
     whisper_model, whisper_processor = load_whisper_model(device)
     waveform = load_audio_waveform(media_path)
     inputs = whisper_processor(
@@ -325,11 +339,19 @@ def transcribe_audio(media_path: Path, device: str) -> str:
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
+    forced_decoder_ids = None
+    if language:
+        forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(
+            language=language,
+            task="transcribe",
+        )
+
     with torch.inference_mode():
         generated_ids = whisper_model.generate(
             input_features=input_features,
             attention_mask=attention_mask,
             task="transcribe",
+            forced_decoder_ids=forced_decoder_ids,
             return_timestamps=False,
         )
 
@@ -340,7 +362,8 @@ def transcribe_audio(media_path: Path, device: str) -> str:
     )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return transcript[0].strip() if transcript else ""
+    detected_language = language or detect_whisper_language(whisper_processor.tokenizer, generated_ids)
+    return (transcript[0].strip() if transcript else ""), detected_language
 
 
 def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT, start_char: int = 0) -> list[tuple[str, int]]:
@@ -512,12 +535,22 @@ def build_audio_records(
     )
 
     if should_transcribe_audio(class_names):
-        transcript = transcribe_audio(media_path, device)
+        transcript, detected_language = transcribe_audio(media_path, device)
+        transcripts: list[tuple[str, str]] = []
         if transcript:
+            label = detected_language or "unknown"
+            transcripts.append((f"Audio transcription ({label}) for {media_label}. {transcript}", label))
+
+        if detected_language and detected_language != "en":
+            translated, _ = transcribe_audio(media_path, device, language="en")
+            if translated:
+                transcripts.append((f"Audio transcription (en) for {media_label}. {translated}", "en"))
+
+        for transcript_text, _lang in transcripts:
             transcript_records = build_text_records(
                 model,
                 metadata_path,
-                f"Audio transcription for {media_label}. {transcript}",
+                transcript_text,
                 task,
                 modality="audio",
                 offset_fn=lambda _char_offset: 0,
