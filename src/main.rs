@@ -1,9 +1,10 @@
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
+use std::{collections::HashSet, env};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
@@ -54,6 +55,14 @@ struct Args {
     /// Maximum number of search results to return
     #[arg(long, default_value_t = 10)]
     limit: usize,
+
+    /// File or directory names or paths to ignore during ingest and watch
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    ignore: Vec<PathBuf>,
+
+    /// File containing newline-separated file or directory names or paths to ignore
+    #[arg(long, value_name = "FILE")]
+    ignore_file: Option<PathBuf>,
 
     /// Watch for changes and keep the index up to date
     #[arg(long, requires = "path", conflicts_with = "search")]
@@ -115,6 +124,11 @@ struct WorkerSession {
     reader: BufReader<std::process::ChildStdout>,
 }
 
+struct IgnoreMatcher {
+    names: HashSet<String>,
+    paths: Vec<PathBuf>,
+}
+
 fn resolve_table_target(db_path: &Path) -> TableTarget {
     if db_path.extension().and_then(|ext| ext.to_str()) == Some("lance") {
         let db_root = match db_path.parent() {
@@ -139,6 +153,57 @@ fn resolve_table_target(db_path: &Path) -> TableTarget {
         table_name: "embeddings".to_string(),
         table_path: db_path.join("embeddings.lance"),
     }
+}
+
+fn normalize_ignore_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(env::current_dir()?.join(path))
+}
+
+fn load_ignore_matcher(args: &Args) -> Result<IgnoreMatcher, Box<dyn std::error::Error>> {
+    let mut raw_entries = Vec::new();
+    raw_entries.extend(args.ignore.iter().cloned());
+
+    if let Some(ignore_file) = &args.ignore_file {
+        let content = fs::read_to_string(ignore_file)?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            raw_entries.push(PathBuf::from(trimmed));
+        }
+    }
+
+    let mut names = HashSet::new();
+    let mut paths = Vec::new();
+
+    for entry in raw_entries {
+        let entry_str = entry.to_string_lossy();
+        if !entry_str.contains(std::path::MAIN_SEPARATOR) && !entry.is_absolute() {
+            names.insert(entry_str.to_string());
+        }
+        paths.push(normalize_ignore_path(&entry)?);
+    }
+
+    Ok(IgnoreMatcher { names, paths })
+}
+
+fn path_matches_ignore_name(path: &Path, matcher: &IgnoreMatcher) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => matcher.names.contains(&name.to_string_lossy().to_string()),
+        _ => false,
+    })
+}
+
+fn path_matches_ignore_path(path: &Path, matcher: &IgnoreMatcher) -> bool {
+    matcher.paths.iter().any(|ignored| path.starts_with(ignored))
+}
+
+fn should_ignore_path(path: &Path, matcher: &IgnoreMatcher) -> bool {
+    path_matches_ignore_name(path, matcher) || path_matches_ignore_path(path, matcher)
 }
 
 fn build_schema(embedding_dim: i32) -> SchemaRef {
@@ -452,8 +517,17 @@ async fn ingest_single_path(
     Ok(summary)
 }
 
-fn should_ignore_event_path(path: &Path, watched_root: &Path, target_file: Option<&Path>, table_target: &TableTarget) -> bool {
+fn should_ignore_event_path(
+    path: &Path,
+    watched_root: &Path,
+    target_file: Option<&Path>,
+    table_target: &TableTarget,
+    ignore_matcher: &IgnoreMatcher,
+) -> bool {
     if path.starts_with(&table_target.table_path) {
+        return true;
+    }
+    if should_ignore_path(path, ignore_matcher) {
         return true;
     }
     if let Some(target_file) = target_file {
@@ -477,8 +551,9 @@ async fn run_ingest(
     connection: &Connection,
     table_target: &TableTarget,
     root_path: &Path,
+    ignore_matcher: &IgnoreMatcher,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let files = collect_files(root_path)?;
+    let files = collect_files(root_path, ignore_matcher)?;
     let mut session = start_worker(args)?;
     let mut table = open_table(connection, &table_target.table_name).await;
     let mut embedding_dim = None;
@@ -528,8 +603,9 @@ async fn run_watch(
     connection: &Connection,
     table_target: &TableTarget,
     root_path: &Path,
+    ignore_matcher: &IgnoreMatcher,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_ingest(args, connection, table_target, root_path).await?;
+    run_ingest(args, connection, table_target, root_path, ignore_matcher).await?;
 
     let watch_target = normalize_existing_path(root_path)?;
     let watched_root = if watch_target.is_dir() {
@@ -567,7 +643,13 @@ async fn run_watch(
                 };
 
                 for path in event.paths {
-                    if should_ignore_event_path(&path, &watched_root, target_file.as_deref(), table_target) {
+                    if should_ignore_event_path(
+                        &path,
+                        &watched_root,
+                        target_file.as_deref(),
+                        table_target,
+                        ignore_matcher,
+                    ) {
                         continue;
                     }
 
@@ -723,7 +805,11 @@ async fn run_search(
     Ok(())
 }
 
-fn collect_files(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn collect_files(path: &Path, ignore_matcher: &IgnoreMatcher) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    if should_ignore_path(path, ignore_matcher) {
+        return Ok(Vec::new());
+    }
+
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
     }
@@ -733,22 +819,26 @@ fn collect_files(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>
     }
 
     let mut files = Vec::new();
-    collect_files_recursive(path, &mut files)?;
+    collect_files_recursive(path, ignore_matcher, &mut files)?;
     files.sort();
     Ok(files)
 }
 
 fn collect_files_recursive(
     path: &Path,
+    ignore_matcher: &IgnoreMatcher,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let entry_path = entry.path();
+        if should_ignore_path(&entry_path, ignore_matcher) {
+            continue;
+        }
         let file_type = entry.file_type()?;
 
         if file_type.is_dir() {
-            collect_files_recursive(&entry_path, files)?;
+            collect_files_recursive(&entry_path, ignore_matcher, files)?;
         } else if file_type.is_file() {
             files.push(entry_path);
         }
@@ -761,6 +851,7 @@ fn collect_files_recursive(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let table_target = resolve_table_target(&args.db);
+    let ignore_matcher = load_ignore_matcher(&args)?;
     let mode = match (args.path.as_deref(), args.search.as_deref()) {
         (Some(path), None) => Mode::Ingest(path),
         (None, Some(query)) => Mode::Search(query),
@@ -786,8 +877,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if args.watch {
-        run_watch(&args, &connection, &table_target, root_path).await
+        run_watch(&args, &connection, &table_target, root_path, &ignore_matcher).await
     } else {
-        run_ingest(&args, &connection, &table_target, root_path).await
+        run_ingest(&args, &connection, &table_target, root_path, &ignore_matcher).await
     }
 }
