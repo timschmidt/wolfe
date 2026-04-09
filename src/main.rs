@@ -64,6 +64,10 @@ struct Args {
     #[arg(long, value_name = "START:END")]
     range: Option<String>,
 
+    /// For non-English audio, also run a second Whisper pass forced to English
+    #[arg(long)]
+    translate: bool,
+
     /// File or directory names or paths to ignore during ingest and watch
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     ignore: Vec<PathBuf>,
@@ -454,6 +458,7 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg(&args.task)
         .arg("--device")
         .arg(&args.device)
+        .args(if args.translate { vec!["--translate"] } else { Vec::new() })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

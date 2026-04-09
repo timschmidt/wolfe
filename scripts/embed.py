@@ -520,6 +520,7 @@ def build_audio_records(
     metadata_path: Path,
     task: str,
     device: str,
+    translate: bool,
     label_name: str | None = None,
 ) -> list[dict[str, object]]:
     media_label = label_name or metadata_path.name
@@ -541,7 +542,7 @@ def build_audio_records(
             label = detected_language or "unknown"
             transcripts.append((f"Audio transcription ({label}) for {media_label}. {transcript}", label))
 
-        if detected_language and detected_language != "en":
+        if translate and detected_language and detected_language != "en":
             translated, _ = transcribe_audio(media_path, device, language="en")
             if translated:
                 transcripts.append((f"Audio transcription (en) for {media_label}. {translated}", "en"))
@@ -778,7 +779,13 @@ def extract_video_keyframes(video_path: Path, output_dir: Path) -> list[Path]:
     return sorted(output_dir.glob("frame-*.jpg"))
 
 
-def build_video_records(model, file_path: Path, task: str, device: str) -> list[dict[str, object]]:
+def build_video_records(
+    model,
+    file_path: Path,
+    task: str,
+    device: str,
+    translate: bool,
+) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     video_stream = get_video_stream_metadata(file_path)
     fps = parse_ffprobe_rate(
@@ -808,6 +815,7 @@ def build_video_records(model, file_path: Path, task: str, device: str) -> list[
                 file_path,
                 task,
                 device,
+                translate,
                 label_name=file_path.name,
             )
             if audio_records:
@@ -868,6 +876,11 @@ def parse_args() -> argparse.Namespace:
         help="Execution device. Defaults to CUDA, then MPS, then CPU when available.",
     )
     parser.add_argument("--query-text", help="Query string to embed for semantic search")
+    parser.add_argument(
+        "--translate",
+        action="store_true",
+        help="For non-English audio, run a second Whisper pass forced to English",
+    )
     return parser.parse_args()
 
 
@@ -924,7 +937,7 @@ def main() -> None:
 
         try:
             if is_video_file(file_path) and has_video_stream(file_path):
-                for record in build_video_records(model, file_path, args.task, device):
+                for record in build_video_records(model, file_path, args.task, device, args.translate):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
@@ -936,7 +949,7 @@ def main() -> None:
                 continue
 
             if is_audio_file(file_path):
-                for record in build_audio_records(model, file_path, file_path, args.task, device):
+                for record in build_audio_records(model, file_path, file_path, args.task, device, args.translate):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
