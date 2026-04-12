@@ -51,6 +51,11 @@ flowchart TD
     AU10 --> AU11[Chunk Translation]
     AU11 --> AU12[Embed Translation Chunks]
     AU12 --> AU13[Store Translation Records]
+    AU --> AU14{Music Detected?}
+    AU14 -->|Yes| AU15[Qwen Omni Music Characterization]
+    AU15 --> AU16[Chunk Description]
+    AU16 --> AU17[Embed Description Chunks]
+    AU17 --> AU18[Store Music Characterization Records]
 
     B -->|Video| V[Extract Subtitle Stream]
     V --> V1[Chunk Captions]
@@ -59,6 +64,8 @@ flowchart TD
     V --> V4[Extract Audio Track]
     V4 --> V5[Audio Pipeline through YAMNet + Whisper]
     V5 --> V6[Store Audio-Derived Records]
+    V4 --> V10[Audio Music Characterization]
+    V10 --> V11[Store Music Characterization Records]
     V --> V7[Extract Keyframes]
     V7 --> V8[Embed Keyframe Images]
     V8 --> V9[Store Keyframe Image Records]
