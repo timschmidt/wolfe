@@ -22,7 +22,7 @@ import torch
 import tensorflow as tf
 import tensorflow_hub as hub
 from PIL import Image
-from transformers import AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers import AutoModel, AutoModelForCausalLM, AutoModelForSpeechSeq2Seq, AutoProcessor
 
 
 IMAGE_EXTENSIONS = {
@@ -63,6 +63,7 @@ YAMNET_SAMPLE_RATE = 16000
 YAMNET_TOP_CLASSES = 10
 YAMNET_TOP_FRAME_CLASSES = 25
 WHISPER_MODEL_ID = "openai/whisper-large-v3"
+QWEN_OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni"
 SPEECH_CLASS_KEYWORDS = (
     "speech",
     "narration",
@@ -83,6 +84,21 @@ SPEECH_CLASS_KEYWORDS = (
     "whoop",
     "babbling",
 )
+MUSIC_CLASS_KEYWORDS = (
+    "music",
+    "musical",
+    "song",
+    "melody",
+    "instrument",
+    "band",
+    "orchestra",
+    "symphony",
+    "choir",
+    "singing",
+    "rap",
+    "hip hop",
+    "dance",
+)
 
 fitz.TOOLS.mupdf_display_errors(False)
 fitz.TOOLS.mupdf_display_warnings(False)
@@ -91,6 +107,8 @@ _AUDIO_CLASSIFIER = None
 _AUDIO_CLASS_NAMES = None
 _WHISPER_MODEL = None
 _WHISPER_PROCESSOR = None
+_QWEN_MODEL = None
+_QWEN_PROCESSOR = None
 
 
 def read_text_file(path: Path) -> str | None:
@@ -247,6 +265,27 @@ def load_whisper_model(device: str):
     return _WHISPER_MODEL, _WHISPER_PROCESSOR
 
 
+def load_qwen_omni_model(device: str):
+    global _QWEN_MODEL, _QWEN_PROCESSOR
+    if _QWEN_MODEL is not None and _QWEN_PROCESSOR is not None:
+        return _QWEN_MODEL, _QWEN_PROCESSOR
+
+    model_dtype = torch.float16 if device == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(
+        QWEN_OMNI_MODEL_ID,
+        torch_dtype=model_dtype,
+        trust_remote_code=True,
+        use_safetensors=True,
+    )
+    model.to(device)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(QWEN_OMNI_MODEL_ID, trust_remote_code=True)
+
+    _QWEN_MODEL = model
+    _QWEN_PROCESSOR = processor
+    return _QWEN_MODEL, _QWEN_PROCESSOR
+
+
 def ensure_sample_rate(original_sample_rate: int, waveform: np.ndarray) -> np.ndarray:
     if original_sample_rate != YAMNET_SAMPLE_RATE:
         desired_length = int(round(float(len(waveform)) / original_sample_rate * YAMNET_SAMPLE_RATE))
@@ -310,6 +349,14 @@ def should_transcribe_audio(class_names: list[str]) -> bool:
     )
 
 
+def should_characterize_music(class_names: list[str]) -> bool:
+    return any(
+        keyword in class_name.lower()
+        for class_name in class_names
+        for keyword in MUSIC_CLASS_KEYWORDS
+    )
+
+
 def detect_whisper_language(tokenizer, generated_ids: torch.Tensor) -> str | None:
     if generated_ids is None:
         return None
@@ -364,6 +411,35 @@ def transcribe_audio(media_path: Path, device: str, language: str | None = None)
         torch.cuda.empty_cache()
     detected_language = language or detect_whisper_language(whisper_processor.tokenizer, generated_ids)
     return (transcript[0].strip() if transcript else ""), detected_language
+
+
+def describe_music(media_path: Path, device: str) -> str:
+    qwen_model, qwen_processor = load_qwen_omni_model(device)
+    waveform = load_audio_waveform(media_path)
+    prompt = "Please identify genre, instrumentation, mood, and similar works to the attached music."
+
+    inputs = qwen_processor(
+        text=prompt,
+        audio=waveform,
+        sampling_rate=YAMNET_SAMPLE_RATE,
+        return_tensors="pt",
+    )
+    inputs = {key: value.to(device) for key, value in inputs.items() if hasattr(value, "to")}
+
+    with torch.inference_mode():
+        generated_ids = qwen_model.generate(
+            **inputs,
+            max_new_tokens=256,
+        )
+
+    description = qwen_processor.tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return description[0].strip() if description else ""
 
 
 def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT, start_char: int = 0) -> list[tuple[str, int]]:
@@ -561,6 +637,26 @@ def build_audio_records(
             for record, offset in zip(transcript_records, transcript_offsets):
                 record["offset"] = offset
             records.extend(transcript_records)
+
+    if should_characterize_music(class_names):
+        try:
+            description = describe_music(media_path, device)
+        except Exception:
+            description = ""
+        if description:
+            description_records = build_text_records(
+                model,
+                metadata_path,
+                f"Music characterization for {media_label}. {description}",
+                task,
+                modality="audio",
+                offset_fn=lambda _char_offset: 0,
+            )
+            description_records = offset_record_chunks(description_records, len(records))
+            description_offsets = linear_offsets(len(description_records), duration_seconds)
+            for record, offset in zip(description_records, description_offsets):
+                record["offset"] = offset
+            records.extend(description_records)
 
     if records:
         record_offsets = linear_offsets(len(records), duration_seconds)
