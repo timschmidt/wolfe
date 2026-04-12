@@ -21,7 +21,7 @@ flowchart TD
     I --> I1[Embed Image]
     I1 --> I2[Store Image Record]
 
-    B -->|Audio| AU[Classify Audio Events (YAMNet)]
+    B -->|Audio| AU[Classify Audio Events through YAMNet]
     AU --> AU1[Build Audio Summary Text]
     AU1 --> AU2[Embed Summary Text]
     AU2 --> AU3[Store Audio Summary Records]
@@ -41,7 +41,7 @@ flowchart TD
     V1 --> V2[Embed Caption Chunks]
     V2 --> V3[Store Caption Records]
     V --> V4[Extract Audio Track]
-    V4 --> V5[Audio Pipeline (YAMNet + Whisper)]
+    V4 --> V5[Audio Pipeline through YAMNet + Whisper]
     V5 --> V6[Store Audio-Derived Records]
     V --> V7[Extract Keyframes]
     V7 --> V8[Embed Keyframe Images]
