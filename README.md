@@ -63,6 +63,14 @@ cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 -
 cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
 ```
 
+### Supported File Types
+
+- Text: UTF-8 text files
+- PDF: `.pdf`
+- Images: `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`
+- Audio: `.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`, `.webm`
+- Video: `.avi`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.ts`, `.webm`
+
 Search:
 
 ```bash
@@ -87,7 +95,7 @@ When `--path` points at a directory, the CLI traverses it recursively
 
 You can exclude content from both recursive ingest and `--watch` with repeated `--ignore` arguments or with `--ignore-file path/to/list.txt`. Ignore entries may be file or directory names such as `node_modules` or `target`, or explicit relative/absolute paths. Any file with a matching name and anything under any directory with a matching name or path is skipped.
 
-Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `wolfe` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, offset, plaintext, file size, and modified timestamp so search results can be mapped back to files. `offset` is stored in bytes for plain text files, seconds for audio-derived records, pages for PDF-derived records, and frames for video-derived records. `plaintext` stores the text input used to create that chunk's embedding when the modality is text-derived, including plain text, PDF text, audio event summaries, transcriptions, and video caption/audio-derived chunks. UTF-8 text files are embedded as text, common image formats (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are embedded through the model's image path, PDFs are processed in both ways: embedded text is extracted and chunked first, then each rendered page is embedded as an image with chunk numbers continuing after the text chunks, common audio formats (`.wav`, `.mp3`, `.flac`, `.ogg`, `.opus`, `.m4a`, `.aac`, `.webm`) are classified with YAMNet and embedded as text summaries of detected audio events. If YAMNet indicates speech or related vocalization categories, Wolfe also runs Whisper large-v3 and stores chunked embeddings of the transcription after the event-summary chunks. When `--translate` is enabled, Wolfe performs a second Whisper pass forced to English for non-English audio and stores those translated chunks immediately after the native-language transcription chunks. Common video formats (`.mp4`, `.mkv`, `.mov`, `.avi`, `.m4v`, `.mpeg`, `.mpg`, `.ts`, `.webm`) are decomposed with `ffmpeg` into subtitle streams, extracted audio, and keyframes. Video subtitle text is chunked and embedded first, the extracted audio is then processed through the same YAMNet and optional Whisper transcription path, and keyframes are finally embedded through the image path with chunk numbers continuing after the text-derived chunks. Text files exceeding 20,000 tokens are chunked locally before embedding, and each chunk is stored as its own row. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
+Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `wolfe` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, offset, plaintext, file size, and modified timestamp so search results can be mapped back to files. `offset` is stored in bytes for plain text files, seconds for audio-derived records, pages for PDF-derived records, and frames for video-derived records. `plaintext` stores the text input used to create that chunk's embedding when the modality is text-derived. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
 
 In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Search results are printed to stdout as tab-separated columns containing the matching path, file name, modality, stored locator (`byte`, `second`, `page`, or `frame`), and the stored `plaintext` snippet for that chunk when available. Use `--range START:END` (0-based, end-exclusive) to return only a subset of results, and `--json` to emit a JSON array instead of tab-separated text. This avoids rerunning Whisper, PDF extraction, or other expensive processing during search.
 
@@ -97,9 +105,54 @@ Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
 ### Ingestion Diagram
 
-See `docs/ingestion-diagram.md` for a diagram of the ingestion pathways by file type.
+```mermaid
+flowchart TD
+    A[Input File] --> B{File Type}
+
+    B -->|Text| T[Read Text File]
+    T --> T1[Chunk Text]
+    T1 --> T2[Embed Text Chunks]
+    T2 --> T3[Store Text Records]
+
+    B -->|PDF| P[Extract PDF Text]
+    P --> P1[Chunk Text]
+    P1 --> P2[Embed Text Chunks]
+    P2 --> P3[Store Text Records]
+    P --> P4[Render Pages to Images]
+    P4 --> P5[Embed Page Images]
+    P5 --> P6[Store Image Records]
+
+    B -->|Image| I[Load Image]
+    I --> I1[Embed Image]
+    I1 --> I2[Store Image Record]
+
+    B -->|Audio| AU[Classify Audio Events through YAMNet]
+    AU --> AU1[Build Audio Summary Text]
+    AU1 --> AU2[Embed Summary Text]
+    AU2 --> AU3[Store Audio Summary Records]
+    AU --> AU4{Speech Detected?}
+    AU4 -->|Yes| AU5[Whisper Transcription]
+    AU5 --> AU6[Chunk Transcription]
+    AU6 --> AU7[Embed Transcription Chunks]
+    AU7 --> AU8[Store Audio Transcription Records]
+    AU5 --> AU9{Non-English + --translate?}
+    AU9 -->|Yes| AU10[Whisper Forced English]
+    AU10 --> AU11[Chunk Translation]
+    AU11 --> AU12[Embed Translation Chunks]
+    AU12 --> AU13[Store Translation Records]
+
+    B -->|Video| V[Extract Subtitle Stream]
+    V --> V1[Chunk Captions]
+    V1 --> V2[Embed Caption Chunks]
+    V2 --> V3[Store Caption Records]
+    V --> V4[Extract Audio Track]
+    V4 --> V5[Audio Pipeline through YAMNet + Whisper]
+    V5 --> V6[Store Audio-Derived Records]
+    V --> V7[Extract Keyframes]
+    V7 --> V8[Embed Keyframe Images]
+    V8 --> V9[Store Keyframe Image Records]
+```
 
 ### Todo
 
 - implement semantic boundary detection (sliding window?, llm based?)
-- implement ingestion progress indicator
