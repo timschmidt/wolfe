@@ -95,6 +95,11 @@ In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
+### Ingestion Diagram
+
+See `docs/ingestion-diagram.md` for a diagram of the ingestion pathways by file type.
+
 ### Todo
 
 - implement semantic boundary detection (sliding window?, llm based?)
+- implement ingestion progress indicator

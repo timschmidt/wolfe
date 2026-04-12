@@ -589,6 +589,7 @@ async fn run_ingest(
     ignore_matcher: &IgnoreMatcher,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let files = collect_files(root_path, ignore_matcher)?;
+    let total_files = files.len();
     let mut session = start_worker(args)?;
     let mut table = open_table(connection, &table_target.table_name).await;
     let mut embedding_dim = None;
@@ -598,7 +599,13 @@ async fn run_ingest(
         errors: 0,
     };
 
-    for file in files {
+    for (index, file) in files.into_iter().enumerate() {
+        eprintln!(
+            "ingest {}/{}: {}",
+            index + 1,
+            total_files,
+            file.display()
+        );
         let file_summary = ingest_single_path(
             &mut session,
             connection,
