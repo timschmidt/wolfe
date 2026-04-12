@@ -6,6 +6,64 @@ For intelligently investigating your files
 
 Local only, 100% offline, your data stays on your computer.
 
+### Supported File Types
+
+- Text: UTF-8 text files
+- PDF: `.pdf`
+- Images: `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`
+- Audio: `.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`, `.webm`
+- Video: `.avi`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.ts`, `.webm`
+
+### Ingestion Diagram
+
+```mermaid
+flowchart TD
+    A[Input File] --> B{File Type}
+
+    B -->|Text| T[Read Text File]
+    T --> T1[Chunk Text]
+    T1 --> T2[Embed Text Chunks]
+    T2 --> T3[Store Text Records]
+
+    B -->|PDF| P[Extract PDF Text]
+    P --> P1[Chunk Text]
+    P1 --> P2[Embed Text Chunks]
+    P2 --> P3[Store Text Records]
+    P --> P4[Render Pages to Images]
+    P4 --> P5[Embed Page Images]
+    P5 --> P6[Store Image Records]
+
+    B -->|Image| I[Load Image]
+    I --> I1[Embed Image]
+    I1 --> I2[Store Image Record]
+
+    B -->|Audio| AU[Classify Audio Events through YAMNet]
+    AU --> AU1[Build Audio Summary Text]
+    AU1 --> AU2[Embed Summary Text]
+    AU2 --> AU3[Store Audio Summary Records]
+    AU --> AU4{Speech Detected?}
+    AU4 -->|Yes| AU5[Whisper Transcription]
+    AU5 --> AU6[Chunk Transcription]
+    AU6 --> AU7[Embed Transcription Chunks]
+    AU7 --> AU8[Store Audio Transcription Records]
+    AU5 --> AU9{Non-English + --translate?}
+    AU9 -->|Yes| AU10[Whisper Forced English]
+    AU10 --> AU11[Chunk Translation]
+    AU11 --> AU12[Embed Translation Chunks]
+    AU12 --> AU13[Store Translation Records]
+
+    B -->|Video| V[Extract Subtitle Stream]
+    V --> V1[Chunk Captions]
+    V1 --> V2[Embed Caption Chunks]
+    V2 --> V3[Store Caption Records]
+    V --> V4[Extract Audio Track]
+    V4 --> V5[Audio Pipeline through YAMNet + Whisper]
+    V5 --> V6[Store Audio-Derived Records]
+    V --> V7[Extract Keyframes]
+    V7 --> V8[Embed Keyframe Images]
+    V8 --> V9[Store Keyframe Image Records]
+```
+
 ## Setup
 
 I would like for Wolfe to be implemented in pure Rust, but currently running the Jina Embeddings V4 model requires the use of a Python wrapper.  Please file a PR or reach out if you know of a way to improve this.  Until then:
@@ -63,14 +121,6 @@ cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 -
 cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
 ```
 
-### Supported File Types
-
-- Text: UTF-8 text files
-- PDF: `.pdf`
-- Images: `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`
-- Audio: `.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`, `.webm`
-- Video: `.avi`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.ts`, `.webm`
-
 Search:
 
 ```bash
@@ -102,56 +152,6 @@ In search mode, the query string is embedded by the same Python model helper and
 In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain. The same ignore rules from `--ignore` and `--ignore-file` are applied to watch events before reindexing.
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
-
-### Ingestion Diagram
-
-```mermaid
-flowchart TD
-    A[Input File] --> B{File Type}
-
-    B -->|Text| T[Read Text File]
-    T --> T1[Chunk Text]
-    T1 --> T2[Embed Text Chunks]
-    T2 --> T3[Store Text Records]
-
-    B -->|PDF| P[Extract PDF Text]
-    P --> P1[Chunk Text]
-    P1 --> P2[Embed Text Chunks]
-    P2 --> P3[Store Text Records]
-    P --> P4[Render Pages to Images]
-    P4 --> P5[Embed Page Images]
-    P5 --> P6[Store Image Records]
-
-    B -->|Image| I[Load Image]
-    I --> I1[Embed Image]
-    I1 --> I2[Store Image Record]
-
-    B -->|Audio| AU[Classify Audio Events through YAMNet]
-    AU --> AU1[Build Audio Summary Text]
-    AU1 --> AU2[Embed Summary Text]
-    AU2 --> AU3[Store Audio Summary Records]
-    AU --> AU4{Speech Detected?}
-    AU4 -->|Yes| AU5[Whisper Transcription]
-    AU5 --> AU6[Chunk Transcription]
-    AU6 --> AU7[Embed Transcription Chunks]
-    AU7 --> AU8[Store Audio Transcription Records]
-    AU5 --> AU9{Non-English + --translate?}
-    AU9 -->|Yes| AU10[Whisper Forced English]
-    AU10 --> AU11[Chunk Translation]
-    AU11 --> AU12[Embed Translation Chunks]
-    AU12 --> AU13[Store Translation Records]
-
-    B -->|Video| V[Extract Subtitle Stream]
-    V --> V1[Chunk Captions]
-    V1 --> V2[Embed Caption Chunks]
-    V2 --> V3[Store Caption Records]
-    V --> V4[Extract Audio Track]
-    V4 --> V5[Audio Pipeline through YAMNet + Whisper]
-    V5 --> V6[Store Audio-Derived Records]
-    V --> V7[Extract Keyframes]
-    V7 --> V8[Embed Keyframe Images]
-    V8 --> V9[Store Keyframe Image Records]
-```
 
 ### Todo
 
