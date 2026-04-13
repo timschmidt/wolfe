@@ -51,6 +51,11 @@ flowchart TD
     AU10 --> AU11[Chunk Translation]
     AU11 --> AU12[Embed Translation Chunks]
     AU12 --> AU13[Store Translation Records]
+    AU --> AU14{Music Detected + --music}
+    AU14 -->|Yes| AU15[Qwen Omni Music Characterization]
+    AU15 --> AU16[Chunk Description]
+    AU16 --> AU17[Embed Description Chunks]
+    AU17 --> AU18[Store Music Characterization Records]
 
     B -->|Video| V[Extract Subtitle Stream]
     V --> V1[Chunk Captions]
@@ -59,6 +64,8 @@ flowchart TD
     V --> V4[Extract Audio Track]
     V4 --> V5[Audio Pipeline through YAMNet + Whisper]
     V5 --> V6[Store Audio-Derived Records]
+    V4 --> V10[Audio Music Characterization --music]
+    V10 --> V11[Store Music Characterization Records]
     V --> V7[Extract Keyframes]
     V7 --> V8[Embed Keyframe Images]
     V8 --> V9[Store Keyframe Image Records]
@@ -71,10 +78,11 @@ I would like for Wolfe to be implemented in pure Rust, but currently running the
 ### Create a Python venv and install deps
 
 ```bash
-python3.12 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "transformers>=4.52,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub
+python -m pip install pcre2
+python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub optimum auto-gptq gptqmodel --no-build-isolation
 ```
 
 Install a PyTorch build that matches your hardware:
@@ -88,7 +96,7 @@ python -m pip install torch torchvision
 - NVIDIA CUDA:
 
 ```bash
-python -m pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 - Apple Silicon:
@@ -98,6 +106,22 @@ python -m pip install torch torchvision
 ```
 
 The helper defaults to `--device auto`, which prefers CUDA, then MPS, then CPU.
+
+### Workaround for pcre
+
+Set up this wrapper for pcre2 as pcre in the .venv
+
+```Python
+python - <<'PY'
+import site
+from pathlib import Path
+
+site_dir = next(p for p in site.getsitepackages() if "site-packages" in p)
+shim = Path(site_dir) / "pcre.py"
+shim.write_text("from pcre2 import *\n")
+print("Wrote shim:", shim)
+PY
+```
 
 ### Ensure model files are present
 
@@ -119,7 +143,14 @@ Optional:
 ```bash
 cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 --task retrieval --python python3 --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --music --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --music --low-memory --db wolfe.lance
 ```
+
+Flags:
+`--translate` runs a second Whisper pass forced to English for non-English audio.
+`--music` enables the music characterization step for audio/video when music is detected.
+`--low-memory` unloads and reloads Jina, Qwen Omni, and Whisper so only one large model is in VRAM at a time during ingest.
 
 Search:
 
@@ -141,6 +172,24 @@ To force a device explicitly:
 cargo run -- --path /path/to/input-or-directory --device cuda
 ```
 
+### CLI Options
+
+- `-p, --path PATH`: File or directory to embed recursively (conflicts with `--search`).
+- `--search TEXT`: Query string to vectorize and search semantically (conflicts with `--path`).
+- `--model-dir PATH`: Path to the local model directory (default: `jina-embeddings-v4`).
+- `--task TASK`: Embedding task name (default: `retrieval`).
+- `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
+- `--python PATH`: Path to the Python interpreter (default: `python3`).
+- `--device DEVICE`: Execution device (`auto`, `cpu`, `cuda`, `mps`) (default: `auto`).
+- `--script PATH`: Path to the embedding helper script (default: `scripts/embed.py`).
+- `--limit N`: Maximum number of search results to return (default: `10`).
+- `--range START:END`: Return a subset of search results (0-based, end-exclusive).
+- `--json`: Emit search results as a JSON array instead of tab-separated text.
+- `--translate`: For non-English audio, run a second Whisper pass forced to English.
+- `--ignore PATH`: File or directory name/path to ignore (repeatable).
+- `--ignore-file FILE`: File containing newline-separated ignore entries.
+- `--watch`: Watch for changes and keep the index up to date (requires `--path`).
+
 When `--path` points at a directory, the CLI traverses it recursively
 
 You can exclude content from both recursive ingest and `--watch` with repeated `--ignore` arguments or with `--ignore-file path/to/list.txt`. Ignore entries may be file or directory names such as `node_modules` or `target`, or explicit relative/absolute paths. Any file with a matching name and anything under any directory with a matching name or path is skipped.
@@ -156,3 +205,6 @@ Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 ### Todo
 
 - implement semantic boundary detection (sliding window?, llm based?)
+- implement multi-threaded pdf decomposition and raster rust-side
+- implement multi-threaded video decomposition rust-side
+- implement multi-threaded document decomposition for LibreOffice, MS Office rust-side

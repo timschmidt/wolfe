@@ -68,6 +68,14 @@ struct Args {
     #[arg(long)]
     translate: bool,
 
+    /// Enable music characterization when music is detected in audio/video
+    #[arg(long)]
+    music: bool,
+
+    /// Unload and reload models so only one of Jina or Qwen Omni is in VRAM at a time
+    #[arg(long)]
+    low_memory: bool,
+
     /// File or directory names or paths to ignore during ingest and watch
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     ignore: Vec<PathBuf>,
@@ -459,6 +467,8 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg("--device")
         .arg(&args.device)
         .args(if args.translate { vec!["--translate"] } else { Vec::new() })
+        .args(if args.music { vec!["--music"] } else { Vec::new() })
+        .args(if args.low_memory { vec!["--low-memory"] } else { Vec::new() })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import gc
 import json
 import os
 import re
 import shutil
 import subprocess
+import contextlib
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -22,7 +24,8 @@ import torch
 import tensorflow as tf
 import tensorflow_hub as hub
 from PIL import Image
-from transformers import AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers import AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor, Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
+from transformers.utils.hub import cached_file
 
 
 IMAGE_EXTENSIONS = {
@@ -63,6 +66,7 @@ YAMNET_SAMPLE_RATE = 16000
 YAMNET_TOP_CLASSES = 10
 YAMNET_TOP_FRAME_CLASSES = 25
 WHISPER_MODEL_ID = "openai/whisper-large-v3"
+QWEN_OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni-7B-GPTQ-Int4"
 SPEECH_CLASS_KEYWORDS = (
     "speech",
     "narration",
@@ -83,6 +87,21 @@ SPEECH_CLASS_KEYWORDS = (
     "whoop",
     "babbling",
 )
+MUSIC_CLASS_KEYWORDS = (
+    "music",
+    "musical",
+    "song",
+    "melody",
+    "instrument",
+    "band",
+    "orchestra",
+    "symphony",
+    "choir",
+    "singing",
+    "rap",
+    "hip hop",
+    "dance",
+)
 
 fitz.TOOLS.mupdf_display_errors(False)
 fitz.TOOLS.mupdf_display_warnings(False)
@@ -91,6 +110,8 @@ _AUDIO_CLASSIFIER = None
 _AUDIO_CLASS_NAMES = None
 _WHISPER_MODEL = None
 _WHISPER_PROCESSOR = None
+_QWEN_MODEL = None
+_QWEN_PROCESSOR = None
 
 
 def read_text_file(path: Path) -> str | None:
@@ -247,6 +268,132 @@ def load_whisper_model(device: str):
     return _WHISPER_MODEL, _WHISPER_PROCESSOR
 
 
+def unload_whisper_model() -> None:
+    global _WHISPER_MODEL, _WHISPER_PROCESSOR
+    _WHISPER_MODEL = None
+    _WHISPER_PROCESSOR = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def load_qwen_omni_model(device: str):
+    global _QWEN_MODEL, _QWEN_PROCESSOR
+    if _QWEN_MODEL is not None and _QWEN_PROCESSOR is not None:
+        return _QWEN_MODEL, _QWEN_PROCESSOR
+
+    model_dtype = torch.float16 if device == "cuda" else torch.float32
+    if "GPTQ" in QWEN_OMNI_MODEL_ID.upper():
+        try:
+            config_path = cached_file(QWEN_OMNI_MODEL_ID, "config.json", local_files_only=True)
+        except Exception:
+            config_path = None
+        if config_path:
+            try:
+                raw_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            except Exception:
+                raw_cfg = None
+            if isinstance(raw_cfg, dict):
+                quant_cfg = raw_cfg.get("quantization_config")
+                if isinstance(quant_cfg, dict):
+                    updated = False
+                    if quant_cfg.get("desc_act") is True:
+                        quant_cfg = dict(quant_cfg)
+                        quant_cfg["desc_act"] = False
+                        if "act_group_aware" in quant_cfg:
+                            quant_cfg["act_group_aware"] = False
+                        updated = True
+                    if "block_name_to_quantize" not in quant_cfg:
+                        quant_cfg = dict(quant_cfg)
+                        quant_cfg["block_name_to_quantize"] = "thinker.model.layers"
+                        updated = True
+                    # Force a non-fused kernel for stability with GPTQ weights. This is slower,
+                    # but avoids TorchFusedQuantLinear NotImplementedError. Consider revisiting
+                    # backend selection for performance once kernels are supported.
+                    desired_backend = "torch"
+                    if quant_cfg.get("backend") != desired_backend:
+                        quant_cfg = dict(quant_cfg)
+                        quant_cfg["backend"] = desired_backend
+                        quant_cfg["use_exllama"] = False
+                        updated = True
+                    if updated:
+                        raw_cfg["quantization_config"] = quant_cfg
+                        Path(config_path).write_text(json.dumps(raw_cfg, indent=2), encoding="utf-8")
+    with contextlib.redirect_stdout(sys.stderr):
+        model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+            QWEN_OMNI_MODEL_ID,
+            torch_dtype=model_dtype,
+            trust_remote_code=True,
+            use_safetensors=True,
+        )
+        model.to(device)
+        model.eval()
+        processor = Qwen2_5OmniProcessor.from_pretrained(QWEN_OMNI_MODEL_ID, trust_remote_code=True)
+
+    _QWEN_MODEL = model
+    _QWEN_PROCESSOR = processor
+    return _QWEN_MODEL, _QWEN_PROCESSOR
+
+
+def unload_qwen_omni_model() -> None:
+    global _QWEN_MODEL, _QWEN_PROCESSOR
+    if _QWEN_MODEL is not None:
+        try:
+            _QWEN_MODEL.to("cpu")
+        except Exception:
+            pass
+    _QWEN_MODEL = None
+    _QWEN_PROCESSOR = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+class JinaEmbedder:
+    def __init__(self, model_dir: Path, device: str) -> None:
+        self.model_dir = model_dir
+        self.device = device
+        self.model = None
+        self.processor = None
+
+    def load(self) -> None:
+        if self.model is not None and self.processor is not None:
+            return
+        model = AutoModel.from_pretrained(
+            self.model_dir.as_posix(),
+            trust_remote_code=True,
+        )
+        processor = AutoProcessor.from_pretrained(
+            self.model_dir.as_posix(),
+            trust_remote_code=True,
+            use_fast=True,
+            fix_mistral_regex=True,
+        )
+        model.processor = processor
+        model.to(self.device)
+        model.eval()
+        if hasattr(model, "verbosity"):
+            model.verbosity = 0
+        if hasattr(model, "model") and hasattr(model.model, "verbosity"):
+            model.model.verbosity = 0
+        self.model = model
+        self.processor = processor
+
+    def unload(self) -> None:
+        if self.model is None and self.processor is None:
+            return
+        if self.model is not None:
+            try:
+                self.model.to("cpu")
+            except Exception:
+                pass
+        self.model = None
+        self.processor = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def ensure_sample_rate(original_sample_rate: int, waveform: np.ndarray) -> np.ndarray:
     if original_sample_rate != YAMNET_SAMPLE_RATE:
         desired_length = int(round(float(len(waveform)) / original_sample_rate * YAMNET_SAMPLE_RATE))
@@ -310,6 +457,14 @@ def should_transcribe_audio(class_names: list[str]) -> bool:
     )
 
 
+def should_characterize_music(class_names: list[str]) -> bool:
+    return any(
+        keyword in class_name.lower()
+        for class_name in class_names
+        for keyword in MUSIC_CLASS_KEYWORDS
+    )
+
+
 def detect_whisper_language(tokenizer, generated_ids: torch.Tensor) -> str | None:
     if generated_ids is None:
         return None
@@ -366,6 +521,46 @@ def transcribe_audio(media_path: Path, device: str, language: str | None = None)
     return (transcript[0].strip() if transcript else ""), detected_language
 
 
+def describe_music(media_path: Path, device: str) -> str:
+    qwen_model, qwen_processor = load_qwen_omni_model(device)
+    waveform = load_audio_waveform(media_path)
+    prompt = "Please identify genre, instrumentation, mood, and similar works to the attached music."
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "audio", "audio": waveform},
+            ],
+        }
+    ]
+    text = qwen_processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    inputs = qwen_processor(
+        text=text,
+        audio=waveform,
+        sampling_rate=YAMNET_SAMPLE_RATE,
+        return_tensors="pt",
+    )
+    inputs = {key: value.to(device) for key, value in inputs.items() if hasattr(value, "to")}
+
+    with contextlib.redirect_stdout(sys.stderr):
+        with torch.inference_mode():
+            generated_ids = qwen_model.generate(
+                **inputs,
+                max_new_tokens=256,
+            )
+
+    description = qwen_processor.tokenizer.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return description[0].strip() if description else ""
+
+
 def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT, start_char: int = 0) -> list[tuple[str, int]]:
     encoded = tokenizer(
         text,
@@ -398,13 +593,18 @@ def chunk_text(tokenizer, text: str, max_tokens: int = TOKEN_CHUNK_LIMIT, start_
 
 
 def encode_text_chunks(
-    model,
+    embedder: JinaEmbedder,
     text: str,
     task: str,
     max_tokens: int,
     start_char: int = 0,
 ) -> list[tuple[int, str, list[float]]]:
-    text_chunks = chunk_text(model.processor.tokenizer, text, max_tokens=max_tokens, start_char=start_char)
+    embedder.load()
+    model = embedder.model
+    processor = embedder.processor
+    if model is None or processor is None:
+        raise RuntimeError("embedding model failed to load")
+    text_chunks = chunk_text(processor.tokenizer, text, max_tokens=max_tokens, start_char=start_char)
     embeddings: list[tuple[int, str, list[float]]] = []
 
     for chunk_text_value, chunk_start in text_chunks:
@@ -423,7 +623,7 @@ def encode_text_chunks(
                 torch.cuda.empty_cache()
             embeddings.extend(
                 encode_text_chunks(
-                    model,
+                    embedder,
                     chunk_text_value,
                     task,
                     max_tokens // 2,
@@ -443,14 +643,16 @@ def encode_text_chunks(
 
 
 def build_text_records(
-    model,
+    embedder: JinaEmbedder,
     file_path: Path,
     text: str,
     task: str,
     modality: str = "text",
     offset_fn=None,
+    low_memory: bool = False,
+    unload_after: bool = True,
 ) -> list[dict[str, object]]:
-    text_embeddings = encode_text_chunks(model, text, task, TOKEN_CHUNK_LIMIT)
+    text_embeddings = encode_text_chunks(embedder, text, task, TOKEN_CHUNK_LIMIT)
     records: list[dict[str, object]] = []
     if offset_fn is None:
         offset_fn = lambda char_offset: len(text[:char_offset].encode("utf-8"))
@@ -467,6 +669,8 @@ def build_text_records(
             )
         )
 
+    if low_memory and unload_after:
+        embedder.unload()
     return records
 
 
@@ -487,22 +691,34 @@ def extract_pdf_content(file_path: Path) -> tuple[list[tuple[int, str]], list[tu
     return text_parts, page_images
 
 
-def build_pdf_records(model, file_path: Path, task: str) -> list[dict[str, object]]:
+def build_pdf_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+    unload_after: bool = True,
+) -> list[dict[str, object]]:
     page_texts, page_images = extract_pdf_content(file_path)
     records: list[dict[str, object]] = []
 
     for page_index, page_text in page_texts:
         if page_text.strip():
             page_records = build_text_records(
-                model,
+                embedder,
                 file_path,
                 page_text,
                 task,
                 offset_fn=lambda _char_offset, page_index=page_index: page_index,
+                low_memory=low_memory,
+                unload_after=False,
             )
             records.extend(offset_record_chunks(page_records, len(records)))
 
     for page_index, page_image in page_images:
+        embedder.load()
+        model = embedder.model
+        if model is None:
+            raise RuntimeError("embedding model failed to load")
         with torch.inference_mode():
             embedding = model.encode_image(images=page_image, task=task)
 
@@ -511,31 +727,40 @@ def build_pdf_records(model, file_path: Path, task: str) -> list[dict[str, objec
 
         records.append(build_record(file_path, "image", embedding, len(records), page_index))
 
+    if low_memory and unload_after:
+        embedder.unload()
     return records
 
 
 def build_audio_records(
-    model,
+    embedder: JinaEmbedder,
     media_path: Path,
     metadata_path: Path,
     task: str,
     device: str,
     translate: bool,
+    music: bool,
+    low_memory: bool,
+    unload_after: bool = True,
     label_name: str | None = None,
 ) -> list[dict[str, object]]:
     media_label = label_name or metadata_path.name
     duration_seconds = audio_duration_seconds(media_path)
     audio_text, class_names = classify_audio_events(media_path, media_label)
     records = build_text_records(
-        model,
+        embedder,
         metadata_path,
         audio_text,
         task,
         modality="audio",
         offset_fn=lambda _char_offset: 0,
+        low_memory=low_memory,
+        unload_after=False,
     )
 
     if should_transcribe_audio(class_names):
+        if low_memory:
+            embedder.unload()
         transcript, detected_language = transcribe_audio(media_path, device)
         transcripts: list[tuple[str, str]] = []
         if transcript:
@@ -549,23 +774,65 @@ def build_audio_records(
 
         for transcript_text, _lang in transcripts:
             transcript_records = build_text_records(
-                model,
+                embedder,
                 metadata_path,
                 transcript_text,
                 task,
                 modality="audio",
                 offset_fn=lambda _char_offset: 0,
+                low_memory=low_memory,
+                unload_after=False,
             )
             transcript_records = offset_record_chunks(transcript_records, len(records))
             transcript_offsets = linear_offsets(len(transcript_records), duration_seconds)
             for record, offset in zip(transcript_records, transcript_offsets):
                 record["offset"] = offset
             records.extend(transcript_records)
+        if low_memory and unload_after:
+            embedder.unload()
+        if low_memory:
+            unload_whisper_model()
+
+    if music and should_characterize_music(class_names):
+        description = ""
+        if low_memory:
+            embedder.unload()
+            unload_whisper_model()
+        try:
+            description = describe_music(media_path, device)
+        except Exception as exc:
+            print(f"music characterization failed for {media_label}: {exc}", file=sys.stderr)
+        finally:
+            if low_memory:
+                unload_qwen_omni_model()
+                embedder.load()
+        if description:
+            description_records = build_text_records(
+                embedder,
+                metadata_path,
+                f"Music characterization for {media_label}. {description}",
+                task,
+                modality="audio",
+                offset_fn=lambda _char_offset: 0,
+                low_memory=low_memory,
+                unload_after=False,
+            )
+            description_records = offset_record_chunks(description_records, len(records))
+            description_offsets = linear_offsets(len(description_records), duration_seconds)
+            for record, offset in zip(description_records, description_offsets):
+                record["offset"] = offset
+            records.extend(description_records)
 
     if records:
         record_offsets = linear_offsets(len(records), duration_seconds)
         for record, offset in zip(records, record_offsets):
             record["offset"] = offset
+
+    if low_memory and not unload_after and embedder.model is None:
+        embedder.load()
+
+    if low_memory and unload_after:
+        embedder.unload()
 
     return records
 
@@ -780,11 +1047,14 @@ def extract_video_keyframes(video_path: Path, output_dir: Path) -> list[Path]:
 
 
 def build_video_records(
-    model,
+    embedder: JinaEmbedder,
     file_path: Path,
     task: str,
     device: str,
     translate: bool,
+    music: bool,
+    low_memory: bool,
+    unload_after: bool = True,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     video_stream = get_video_stream_metadata(file_path)
@@ -798,24 +1068,29 @@ def build_video_records(
         caption_cues = extract_video_caption_text(file_path, temp_dir, fps)
         for cue_offset, cue_text in caption_cues:
             caption_records = build_text_records(
-                model,
+                embedder,
                 file_path,
                 f"Closed captions for {file_path.name}. {cue_text}",
                 task,
                 modality="video_text",
                 offset_fn=lambda _char_offset, cue_offset=cue_offset: cue_offset,
+                low_memory=low_memory,
+                unload_after=False,
             )
             records.extend(offset_record_chunks(caption_records, len(records)))
 
         audio_path = extract_video_audio(file_path, temp_dir)
         if audio_path is not None:
             audio_records = build_audio_records(
-                model,
+                embedder,
                 audio_path,
                 file_path,
                 task,
                 device,
                 translate,
+                music,
+                low_memory,
+                unload_after=False,
                 label_name=file_path.name,
             )
             if audio_records:
@@ -829,6 +1104,10 @@ def build_video_records(
         keyframe_offsets = extract_video_keyframe_offsets(file_path, fps)
         keyframe_paths = extract_video_keyframes(file_path, temp_dir)
         for keyframe_index, keyframe_path in enumerate(keyframe_paths):
+            embedder.load()
+            model = embedder.model
+            if model is None:
+                raise RuntimeError("embedding model failed to load")
             with torch.inference_mode():
                 embedding = model.encode_image(images=keyframe_path.as_posix(), task=task)
 
@@ -838,6 +1117,8 @@ def build_video_records(
             frame_offset = keyframe_offsets[keyframe_index] if keyframe_index < len(keyframe_offsets) else keyframe_index
             records.append(build_record(file_path, "image", embedding, len(records), frame_offset))
 
+        if low_memory and unload_after:
+            embedder.unload()
     return records
 
 
@@ -881,32 +1162,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="For non-English audio, run a second Whisper pass forced to English",
     )
+    parser.add_argument(
+        "--music",
+        action="store_true",
+        help="Enable music characterization for audio/video when music is detected",
+    )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Unload and reload models so only one of Jina or Qwen Omni is in VRAM at a time",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     device = detect_device(args.device)
-
-    model = AutoModel.from_pretrained(
-        args.model_dir.as_posix(),
-        trust_remote_code=True,
-    )
-    # Jina Embeddings v4 inherits a processor/tokenizer path that needs the Mistral regex fix.
-    model.processor = AutoProcessor.from_pretrained(
-        args.model_dir.as_posix(),
-        trust_remote_code=True,
-        use_fast=True,
-        fix_mistral_regex=True,
-    )
-    model.to(device)
-    model.eval()
-    if hasattr(model, "verbosity"):
-        model.verbosity = 0
-    if hasattr(model, "model") and hasattr(model.model, "verbosity"):
-        model.model.verbosity = 0
+    embedder = JinaEmbedder(args.model_dir, device)
+    embedder.load()
 
     if args.query_text is not None:
+        embedder.load()
+        model = embedder.model
+        if model is None:
+            raise RuntimeError("embedding model failed to load")
         with torch.inference_mode():
             embedding = model.encode_text(texts=args.query_text, task=args.task)
 
@@ -937,24 +1216,53 @@ def main() -> None:
 
         try:
             if is_video_file(file_path) and has_video_stream(file_path):
-                for record in build_video_records(model, file_path, args.task, device, args.translate):
+                for record in build_video_records(
+                    embedder,
+                    file_path,
+                    args.task,
+                    device,
+                    args.translate,
+                    args.music,
+                    args.low_memory,
+                    unload_after=False,
+                ):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
             if is_pdf_file(file_path):
-                for record in build_pdf_records(model, file_path, args.task):
+                for record in build_pdf_records(
+                    embedder,
+                    file_path,
+                    args.task,
+                    args.low_memory,
+                    unload_after=False,
+                ):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
             if is_audio_file(file_path):
-                for record in build_audio_records(model, file_path, file_path, args.task, device, args.translate):
+                for record in build_audio_records(
+                    embedder,
+                    file_path,
+                    file_path,
+                    args.task,
+                    device,
+                    args.translate,
+                    args.music,
+                    args.low_memory,
+                    unload_after=False,
+                ):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
             if is_image_file(file_path):
+                embedder.load()
+                model = embedder.model
+                if model is None:
+                    raise RuntimeError("embedding model failed to load")
                 with torch.inference_mode():
                     embedding = model.encode_image(images=file_path.as_posix(), task=args.task)
 
@@ -977,7 +1285,14 @@ def main() -> None:
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
-            for record in build_text_records(model, file_path, text, args.task):
+            for record in build_text_records(
+                embedder,
+                file_path,
+                text,
+                args.task,
+                low_memory=args.low_memory,
+                unload_after=False,
+            ):
                 emit_json(record)
             emit_json({"status": "done", "path": file_path.resolve().as_posix()})
         except Exception as exc:
