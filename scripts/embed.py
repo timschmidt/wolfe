@@ -9,6 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import builtins
+from enum import Enum
+import inspect
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -281,6 +284,73 @@ def load_qwen_omni_model(device: str):
         return _QWEN_MODEL, _QWEN_PROCESSOR
 
     model_dtype = torch.float16 if device == "cuda" else torch.float32
+    if "GPTQ" in QWEN_OMNI_MODEL_ID.upper():
+        try:
+            import auto_gptq  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Qwen GPTQ model selected but auto-gptq is not available. "
+                "Install auto-gptq to use the GPTQ checkpoint."
+            ) from exc
+
+        quantize_config = getattr(auto_gptq, "QuantizeConfig", None)
+        if quantize_config is None:
+            quantize_config = getattr(auto_gptq, "BaseQuantizeConfig", None)
+        if quantize_config is None:
+            raise RuntimeError(
+                "auto-gptq is installed but QuantizeConfig is unavailable; "
+                "please install a compatible auto-gptq version."
+            )
+        if quantize_config is not None:
+            base_qconfig = quantize_config
+            try:
+                sig = inspect.signature(base_qconfig)
+                allowed_params = set(sig.parameters.keys())
+            except (TypeError, ValueError):
+                allowed_params = set()
+
+            class _CompatQuantizeConfig(base_qconfig):  # type: ignore[misc]
+                def __init__(self, *args, **kwargs):
+                    if allowed_params:
+                        kwargs = {k: v for k, v in kwargs.items() if k in allowed_params}
+                    super().__init__(*args, **kwargs)
+
+            builtins.QuantizeConfig = _CompatQuantizeConfig
+        if not hasattr(builtins, "METHOD"):
+            method = getattr(auto_gptq, "METHOD", None)
+            if method is None:
+                try:
+                    from auto_gptq.utils.import_utils import METHOD as _METHOD  # type: ignore
+                except Exception:
+                    _METHOD = None
+                method = _METHOD
+            if method is None:
+                class _GPTQMethod(str, Enum):
+                    GPTQ = "gptq"
+                    EXLLAMA = "exllama"
+                    EXLLAMA_V2 = "exllama_v2"
+                    TRITON = "triton"
+
+                method = _GPTQMethod
+            builtins.METHOD = method
+        if not hasattr(builtins, "FORMAT"):
+            fmt = getattr(auto_gptq, "FORMAT", None)
+            if fmt is None:
+                try:
+                    from auto_gptq.utils.import_utils import FORMAT as _FORMAT  # type: ignore
+                except Exception:
+                    _FORMAT = None
+                fmt = _FORMAT
+            if fmt is None:
+                class _GPTQFormat(str, Enum):
+                    AUTO = "auto"
+                    GPTQ = "gptq"
+                    GPTQ_INT4 = "gptq_int4"
+                    GPTQ_INT8 = "gptq_int8"
+
+                fmt = _GPTQFormat
+            builtins.FORMAT = fmt
+
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         QWEN_OMNI_MODEL_ID,
         torch_dtype=model_dtype,

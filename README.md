@@ -81,7 +81,7 @@ I would like for Wolfe to be implemented in pure Rust, but currently running the
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub
+python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub optimum auto-gptq
 ```
 
 Install a PyTorch build that matches your hardware:
