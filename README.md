@@ -51,7 +51,7 @@ flowchart TD
     AU10 --> AU11[Chunk Translation]
     AU11 --> AU12[Embed Translation Chunks]
     AU12 --> AU13[Store Translation Records]
-    AU --> AU14{Music Detected?}
+    AU --> AU14{Music Detected + --music?}
     AU14 -->|Yes| AU15[Qwen Omni Music Characterization]
     AU15 --> AU16[Chunk Description]
     AU16 --> AU17[Embed Description Chunks]
@@ -64,7 +64,7 @@ flowchart TD
     V --> V4[Extract Audio Track]
     V4 --> V5[Audio Pipeline through YAMNet + Whisper]
     V5 --> V6[Store Audio-Derived Records]
-    V4 --> V10[Audio Music Characterization]
+    V4 --> V10[Audio Music Characterization (--music)]
     V10 --> V11[Store Music Characterization Records]
     V --> V7[Extract Keyframes]
     V7 --> V8[Embed Keyframe Images]
@@ -81,7 +81,7 @@ I would like for Wolfe to be implemented in pure Rust, but currently running the
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "transformers>=4.52,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub
+python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub
 ```
 
 Install a PyTorch build that matches your hardware:
@@ -126,7 +126,14 @@ Optional:
 ```bash
 cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 --task retrieval --python python3 --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --music --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --music --low-memory --db wolfe.lance
 ```
+
+Flags:
+`--translate` runs a second Whisper pass forced to English for non-English audio.
+`--music` enables the music characterization step for audio/video when music is detected.
+`--low-memory` unloads and reloads Jina and Qwen Omni so only one is in VRAM at a time during ingest.
 
 Search:
 
