@@ -148,6 +148,24 @@ To force a device explicitly:
 cargo run -- --path /path/to/input-or-directory --device cuda
 ```
 
+### CLI Options
+
+- `-p, --path PATH`: File or directory to embed recursively (conflicts with `--search`).
+- `--search TEXT`: Query string to vectorize and search semantically (conflicts with `--path`).
+- `--model-dir PATH`: Path to the local model directory (default: `jina-embeddings-v4`).
+- `--task TASK`: Embedding task name (default: `retrieval`).
+- `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
+- `--python PATH`: Path to the Python interpreter (default: `python3`).
+- `--device DEVICE`: Execution device (`auto`, `cpu`, `cuda`, `mps`) (default: `auto`).
+- `--script PATH`: Path to the embedding helper script (default: `scripts/embed.py`).
+- `--limit N`: Maximum number of search results to return (default: `10`).
+- `--range START:END`: Return a subset of search results (0-based, end-exclusive).
+- `--json`: Emit search results as a JSON array instead of tab-separated text.
+- `--translate`: For non-English audio, run a second Whisper pass forced to English.
+- `--ignore PATH`: File or directory name/path to ignore (repeatable).
+- `--ignore-file FILE`: File containing newline-separated ignore entries.
+- `--watch`: Watch for changes and keep the index up to date (requires `--path`).
+
 When `--path` points at a directory, the CLI traverses it recursively
 
 You can exclude content from both recursive ingest and `--watch` with repeated `--ignore` arguments or with `--ignore-file path/to/list.txt`. Ignore entries may be file or directory names such as `node_modules` or `target`, or explicit relative/absolute paths. Any file with a matching name and anything under any directory with a matching name or path is skipped.
