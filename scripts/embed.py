@@ -64,7 +64,7 @@ YAMNET_SAMPLE_RATE = 16000
 YAMNET_TOP_CLASSES = 10
 YAMNET_TOP_FRAME_CLASSES = 25
 WHISPER_MODEL_ID = "openai/whisper-large-v3"
-QWEN_OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni-7B"
+QWEN_OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni-7B-GPTQ-Int4"
 SPEECH_CLASS_KEYWORDS = (
     "speech",
     "narration",
@@ -599,6 +599,8 @@ def build_text_records(
     task: str,
     modality: str = "text",
     offset_fn=None,
+    low_memory: bool = False,
+    unload_after: bool = True,
 ) -> list[dict[str, object]]:
     text_embeddings = encode_text_chunks(embedder, text, task, TOKEN_CHUNK_LIMIT)
     records: list[dict[str, object]] = []
@@ -617,6 +619,8 @@ def build_text_records(
             )
         )
 
+    if low_memory and unload_after:
+        embedder.unload()
     return records
 
 
@@ -637,7 +641,13 @@ def extract_pdf_content(file_path: Path) -> tuple[list[tuple[int, str]], list[tu
     return text_parts, page_images
 
 
-def build_pdf_records(embedder: JinaEmbedder, file_path: Path, task: str) -> list[dict[str, object]]:
+def build_pdf_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+    unload_after: bool = True,
+) -> list[dict[str, object]]:
     page_texts, page_images = extract_pdf_content(file_path)
     records: list[dict[str, object]] = []
 
@@ -649,6 +659,8 @@ def build_pdf_records(embedder: JinaEmbedder, file_path: Path, task: str) -> lis
                 page_text,
                 task,
                 offset_fn=lambda _char_offset, page_index=page_index: page_index,
+                low_memory=low_memory,
+                unload_after=False,
             )
             records.extend(offset_record_chunks(page_records, len(records)))
 
@@ -665,6 +677,8 @@ def build_pdf_records(embedder: JinaEmbedder, file_path: Path, task: str) -> lis
 
         records.append(build_record(file_path, "image", embedding, len(records), page_index))
 
+    if low_memory and unload_after:
+        embedder.unload()
     return records
 
 
@@ -677,6 +691,7 @@ def build_audio_records(
     translate: bool,
     music: bool,
     low_memory: bool,
+    unload_after: bool = True,
     label_name: str | None = None,
 ) -> list[dict[str, object]]:
     media_label = label_name or metadata_path.name
@@ -689,9 +704,13 @@ def build_audio_records(
         task,
         modality="audio",
         offset_fn=lambda _char_offset: 0,
+        low_memory=low_memory,
+        unload_after=False,
     )
 
     if should_transcribe_audio(class_names):
+        if low_memory:
+            embedder.unload()
         transcript, detected_language = transcribe_audio(media_path, device)
         transcripts: list[tuple[str, str]] = []
         if transcript:
@@ -711,12 +730,18 @@ def build_audio_records(
                 task,
                 modality="audio",
                 offset_fn=lambda _char_offset: 0,
+                low_memory=low_memory,
+                unload_after=False,
             )
             transcript_records = offset_record_chunks(transcript_records, len(records))
             transcript_offsets = linear_offsets(len(transcript_records), duration_seconds)
             for record, offset in zip(transcript_records, transcript_offsets):
                 record["offset"] = offset
             records.extend(transcript_records)
+        if low_memory and unload_after:
+            embedder.unload()
+        if low_memory:
+            unload_whisper_model()
 
     if music and should_characterize_music(class_names):
         description = ""
@@ -739,6 +764,8 @@ def build_audio_records(
                 task,
                 modality="audio",
                 offset_fn=lambda _char_offset: 0,
+                low_memory=low_memory,
+                unload_after=False,
             )
             description_records = offset_record_chunks(description_records, len(records))
             description_offsets = linear_offsets(len(description_records), duration_seconds)
@@ -750,6 +777,12 @@ def build_audio_records(
         record_offsets = linear_offsets(len(records), duration_seconds)
         for record, offset in zip(records, record_offsets):
             record["offset"] = offset
+
+    if low_memory and not unload_after and embedder.model is None:
+        embedder.load()
+
+    if low_memory and unload_after:
+        embedder.unload()
 
     return records
 
@@ -971,6 +1004,7 @@ def build_video_records(
     translate: bool,
     music: bool,
     low_memory: bool,
+    unload_after: bool = True,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     video_stream = get_video_stream_metadata(file_path)
@@ -990,6 +1024,8 @@ def build_video_records(
                 task,
                 modality="video_text",
                 offset_fn=lambda _char_offset, cue_offset=cue_offset: cue_offset,
+                low_memory=low_memory,
+                unload_after=False,
             )
             records.extend(offset_record_chunks(caption_records, len(records)))
 
@@ -1004,6 +1040,7 @@ def build_video_records(
                 translate,
                 music,
                 low_memory,
+                unload_after=False,
                 label_name=file_path.name,
             )
             if audio_records:
@@ -1030,6 +1067,8 @@ def build_video_records(
             frame_offset = keyframe_offsets[keyframe_index] if keyframe_index < len(keyframe_offsets) else keyframe_index
             records.append(build_record(file_path, "image", embedding, len(records), frame_offset))
 
+        if low_memory and unload_after:
+            embedder.unload()
     return records
 
 
@@ -1135,13 +1174,20 @@ def main() -> None:
                     args.translate,
                     args.music,
                     args.low_memory,
+                    unload_after=False,
                 ):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
             if is_pdf_file(file_path):
-                for record in build_pdf_records(embedder, file_path, args.task):
+                for record in build_pdf_records(
+                    embedder,
+                    file_path,
+                    args.task,
+                    args.low_memory,
+                    unload_after=False,
+                ):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
@@ -1156,6 +1202,7 @@ def main() -> None:
                     args.translate,
                     args.music,
                     args.low_memory,
+                    unload_after=False,
                 ):
                     emit_json(record)
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
@@ -1188,7 +1235,14 @@ def main() -> None:
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
-            for record in build_text_records(embedder, file_path, text, args.task):
+            for record in build_text_records(
+                embedder,
+                file_path,
+                text,
+                args.task,
+                low_memory=args.low_memory,
+                unload_after=False,
+            ):
                 emit_json(record)
             emit_json({"status": "done", "path": file_path.resolve().as_posix()})
         except Exception as exc:
