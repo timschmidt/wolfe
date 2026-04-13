@@ -266,6 +266,15 @@ def load_whisper_model(device: str):
     return _WHISPER_MODEL, _WHISPER_PROCESSOR
 
 
+def unload_whisper_model() -> None:
+    global _WHISPER_MODEL, _WHISPER_PROCESSOR
+    _WHISPER_MODEL = None
+    _WHISPER_PROCESSOR = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def load_qwen_omni_model(device: str):
     global _QWEN_MODEL, _QWEN_PROCESSOR
     if _QWEN_MODEL is not None and _QWEN_PROCESSOR is not None:
@@ -289,6 +298,11 @@ def load_qwen_omni_model(device: str):
 
 def unload_qwen_omni_model() -> None:
     global _QWEN_MODEL, _QWEN_PROCESSOR
+    if _QWEN_MODEL is not None:
+        try:
+            _QWEN_MODEL.to("cpu")
+        except Exception:
+            pass
     _QWEN_MODEL = None
     _QWEN_PROCESSOR = None
     gc.collect()
@@ -329,6 +343,11 @@ class JinaEmbedder:
     def unload(self) -> None:
         if self.model is None and self.processor is None:
             return
+        if self.model is not None:
+            try:
+                self.model.to("cpu")
+            except Exception:
+                pass
         self.model = None
         self.processor = None
         gc.collect()
@@ -703,6 +722,7 @@ def build_audio_records(
         description = ""
         if low_memory:
             embedder.unload()
+            unload_whisper_model()
         try:
             description = describe_music(media_path, device)
         except Exception as exc:
