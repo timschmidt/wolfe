@@ -14,7 +14,10 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.7",
+)
 
 import fitz
 import numpy as np
@@ -24,7 +27,7 @@ import torch
 import tensorflow as tf
 import tensorflow_hub as hub
 from PIL import Image
-from transformers import AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor, Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
+from transformers import AutoConfig, AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor, Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 from transformers.utils.hub import cached_file
 
 
@@ -66,7 +69,7 @@ YAMNET_SAMPLE_RATE = 16000
 YAMNET_TOP_CLASSES = 10
 YAMNET_TOP_FRAME_CLASSES = 25
 WHISPER_MODEL_ID = "openai/whisper-large-v3"
-QWEN_OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni-7B-GPTQ-Int4"
+QWEN_OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni-7B"
 SPEECH_CLASS_KEYWORDS = (
     "speech",
     "narration",
@@ -108,10 +111,12 @@ fitz.TOOLS.mupdf_display_warnings(False)
 
 _AUDIO_CLASSIFIER = None
 _AUDIO_CLASS_NAMES = None
+_TF_GPU_DISABLED = False
 _WHISPER_MODEL = None
 _WHISPER_PROCESSOR = None
 _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
+_QWEN_DEVICE_MAP_AUTO = False
 
 
 def read_text_file(path: Path) -> str | None:
@@ -236,6 +241,7 @@ def load_audio_classifier():
     if _AUDIO_CLASSIFIER is not None:
         return _AUDIO_CLASSIFIER, _AUDIO_CLASS_NAMES
 
+    disable_tf_gpu()
     classifier = hub.load("https://tfhub.dev/google/yamnet/1")
     class_names = []
     with tf.io.gfile.GFile(classifier.class_map_path().numpy()) as csvfile:
@@ -246,6 +252,32 @@ def load_audio_classifier():
     _AUDIO_CLASSIFIER = classifier
     _AUDIO_CLASS_NAMES = class_names
     return _AUDIO_CLASSIFIER, _AUDIO_CLASS_NAMES
+
+
+def unload_audio_classifier() -> None:
+    global _AUDIO_CLASSIFIER, _AUDIO_CLASS_NAMES
+    _AUDIO_CLASSIFIER = None
+    _AUDIO_CLASS_NAMES = None
+    try:
+        tf.keras.backend.clear_session()
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def disable_tf_gpu() -> None:
+    """Ensure TensorFlow uses CPU only to save VRAM for other models."""
+    global _TF_GPU_DISABLED
+    if _TF_GPU_DISABLED:
+        return
+    try:
+        if tf.config.list_physical_devices("GPU"):
+            tf.config.set_visible_devices([], "GPU")
+    except Exception:
+        pass
+    _TF_GPU_DISABLED = True
 
 
 def load_whisper_model(device: str):
@@ -277,7 +309,7 @@ def unload_whisper_model() -> None:
         torch.cuda.empty_cache()
 
 
-def load_qwen_omni_model(device: str):
+def load_qwen_omni_model(device: str, qwen_max_memory_mb: int | None):
     global _QWEN_MODEL, _QWEN_PROCESSOR
     if _QWEN_MODEL is not None and _QWEN_PROCESSOR is not None:
         return _QWEN_MODEL, _QWEN_PROCESSOR
@@ -319,31 +351,46 @@ def load_qwen_omni_model(device: str):
                     if updated:
                         raw_cfg["quantization_config"] = quant_cfg
                         Path(config_path).write_text(json.dumps(raw_cfg, indent=2), encoding="utf-8")
+    config = AutoConfig.from_pretrained(QWEN_OMNI_MODEL_ID, trust_remote_code=True)
+    if hasattr(config, "enable_audio_output"):
+        config.enable_audio_output = False
+    max_memory = None
+    device_map = "auto"
+    if qwen_max_memory_mb and device == "cuda":
+        max_memory = {0: f"{qwen_max_memory_mb}MB"}
     with contextlib.redirect_stdout(sys.stderr):
-        model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
             QWEN_OMNI_MODEL_ID,
-            torch_dtype=model_dtype,
+            torch_dtype="auto",
+            device_map=device_map,
+            attn_implementation="sdpa",
+            low_cpu_mem_usage=True,
             trust_remote_code=True,
             use_safetensors=True,
+            config=config,
+            max_memory=max_memory,
         )
-        model.to(device)
         model.eval()
         processor = Qwen2_5OmniProcessor.from_pretrained(QWEN_OMNI_MODEL_ID, trust_remote_code=True)
 
     _QWEN_MODEL = model
     _QWEN_PROCESSOR = processor
+    global _QWEN_DEVICE_MAP_AUTO
+    _QWEN_DEVICE_MAP_AUTO = device_map == "auto"
     return _QWEN_MODEL, _QWEN_PROCESSOR
 
 
 def unload_qwen_omni_model() -> None:
     global _QWEN_MODEL, _QWEN_PROCESSOR
-    if _QWEN_MODEL is not None:
+    global _QWEN_DEVICE_MAP_AUTO
+    if _QWEN_MODEL is not None and not _QWEN_DEVICE_MAP_AUTO:
         try:
             _QWEN_MODEL.to("cpu")
         except Exception:
             pass
     _QWEN_MODEL = None
     _QWEN_PROCESSOR = None
+    _QWEN_DEVICE_MAP_AUTO = False
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -425,7 +472,8 @@ def audio_duration_seconds(file_path: Path) -> int:
 def classify_audio_events(media_path: Path, label_name: str) -> tuple[str, list[str]]:
     classifier, class_names = load_audio_classifier()
     waveform = load_audio_waveform(media_path)
-    scores, _, _ = classifier(waveform)
+    with tf.device("/CPU:0"):
+        scores, _, _ = classifier(waveform)
     scores_np = scores.numpy()
 
     mean_scores = scores_np.mean(axis=0)
@@ -521,8 +569,8 @@ def transcribe_audio(media_path: Path, device: str, language: str | None = None)
     return (transcript[0].strip() if transcript else ""), detected_language
 
 
-def describe_music(media_path: Path, device: str) -> str:
-    qwen_model, qwen_processor = load_qwen_omni_model(device)
+def describe_music(media_path: Path, device: str, qwen_max_memory_mb: int | None) -> str:
+    qwen_model, qwen_processor = load_qwen_omni_model(device, qwen_max_memory_mb)
     waveform = load_audio_waveform(media_path)
     prompt = "Please identify genre, instrumentation, mood, and similar works to the attached music."
 
@@ -549,6 +597,7 @@ def describe_music(media_path: Path, device: str) -> str:
             generated_ids = qwen_model.generate(
                 **inputs,
                 max_new_tokens=256,
+                use_cache=False,
             )
 
     description = qwen_processor.tokenizer.batch_decode(
@@ -741,6 +790,7 @@ def build_audio_records(
     translate: bool,
     music: bool,
     low_memory: bool,
+    qwen_max_memory_mb: int | None,
     unload_after: bool = True,
     label_name: str | None = None,
 ) -> list[dict[str, object]]:
@@ -798,8 +848,9 @@ def build_audio_records(
         if low_memory:
             embedder.unload()
             unload_whisper_model()
+            unload_audio_classifier()
         try:
-            description = describe_music(media_path, device)
+            description = describe_music(media_path, device, qwen_max_memory_mb)
         except Exception as exc:
             print(f"music characterization failed for {media_label}: {exc}", file=sys.stderr)
         finally:
@@ -1054,6 +1105,7 @@ def build_video_records(
     translate: bool,
     music: bool,
     low_memory: bool,
+    qwen_max_memory_mb: int | None,
     unload_after: bool = True,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
@@ -1090,6 +1142,7 @@ def build_video_records(
                 translate,
                 music,
                 low_memory,
+                qwen_max_memory_mb,
                 unload_after=False,
                 label_name=file_path.name,
             )
@@ -1172,6 +1225,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Unload and reload models so only one of Jina or Qwen Omni is in VRAM at a time",
     )
+    parser.add_argument(
+        "--qwen-max-memory",
+        type=int,
+        help="Max VRAM for Qwen in MB (used with device_map=auto)",
+    )
     return parser.parse_args()
 
 
@@ -1224,6 +1282,7 @@ def main() -> None:
                     args.translate,
                     args.music,
                     args.low_memory,
+                    args.qwen_max_memory,
                     unload_after=False,
                 ):
                     emit_json(record)
@@ -1252,6 +1311,7 @@ def main() -> None:
                     args.translate,
                     args.music,
                     args.low_memory,
+                    args.qwen_max_memory,
                     unload_after=False,
                 ):
                     emit_json(record)

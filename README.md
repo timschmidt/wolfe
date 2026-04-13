@@ -84,12 +84,14 @@ cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 -
 cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --music --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --music --low-memory --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --music --low-memory --qwen-max-memory 6000 --db wolfe.lance
 ```
 
 Flags:
 `--translate` runs a second Whisper pass forced to English for non-English audio.
 `--music` enables the music characterization step for audio/video when music is detected.
 `--low-memory` unloads and reloads Jina, Qwen Omni, and Whisper so only one large model is in VRAM at a time during ingest.
+`--qwen-max-memory` caps Qwen's GPU usage (in MB) when `device_map=auto` is used; lower values offload more to CPU.
 
 Search:
 
@@ -152,7 +154,7 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install pcre2
-python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub optimum auto-gptq gptqmodel --no-build-isolation
+python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub --no-build-isolation
 ```
 
 Install a PyTorch build that matches your hardware:
@@ -166,7 +168,7 @@ python -m pip install torch torchvision
 - NVIDIA CUDA:
 
 ```bash
-python -m pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-cache-dir torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 - Apple Silicon:

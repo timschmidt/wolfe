@@ -72,6 +72,10 @@ struct Args {
     #[arg(long)]
     music: bool,
 
+    /// Max VRAM for Qwen in MB (used with device_map=auto)
+    #[arg(long, value_name = "MB")]
+    qwen_max_memory: Option<usize>,
+
     /// Unload and reload models so only one of Jina or Qwen Omni is in VRAM at a time
     #[arg(long)]
     low_memory: bool,
@@ -468,6 +472,11 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg(&args.device)
         .args(if args.translate { vec!["--translate"] } else { Vec::new() })
         .args(if args.music { vec!["--music"] } else { Vec::new() })
+        .args(
+            args.qwen_max_memory
+                .map(|value| vec!["--qwen-max-memory".to_string(), value.to_string()])
+                .unwrap_or_default(),
+        )
         .args(if args.low_memory { vec!["--low-memory"] } else { Vec::new() })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
