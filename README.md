@@ -71,6 +71,76 @@ flowchart TD
     V8 --> V9[Store Keyframe Image Records]
 ```
 
+## Usage
+
+```bash
+cargo run -- --path /path/to/input.txt
+```
+
+Optional:
+
+```bash
+cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 --task retrieval --python python3 --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --music --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --music --low-memory --db wolfe.lance
+```
+
+Flags:
+`--translate` runs a second Whisper pass forced to English for non-English audio.
+`--music` enables the music characterization step for audio/video when music is detected.
+`--low-memory` unloads and reloads Jina, Qwen Omni, and Whisper so only one large model is in VRAM at a time during ingest.
+
+Search:
+
+```bash
+cargo run -- --search "error handling in rust" --db wolfe.lance --limit 10
+cargo run -- --search "error handling in rust" --db wolfe.lance --range 10:20
+cargo run -- --search "error handling in rust" --db wolfe.lance --json
+```
+
+Watch for changes:
+
+```bash
+cargo run -- --path /path/to/input-or-directory --watch --db wolfe.lance
+```
+
+To force a device explicitly:
+
+```bash
+cargo run -- --path /path/to/input-or-directory --device cuda
+```
+
+When `--path` points at a directory, the CLI traverses it recursively
+
+You can exclude content from both recursive ingest and `--watch` with repeated `--ignore` arguments or with `--ignore-file path/to/list.txt`. Ignore entries may be file or directory names such as `node_modules` or `target`, or explicit relative/absolute paths. Any file with a matching name and anything under any directory with a matching name or path is skipped.
+
+Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `wolfe` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, offset, plaintext, file size, and modified timestamp so search results can be mapped back to files. `offset` is stored in bytes for plain text files, seconds for audio-derived records, pages for PDF-derived records, and frames for video-derived records. `plaintext` stores the text input used to create that chunk's embedding when the modality is text-derived. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
+
+In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Search results are printed to stdout as tab-separated columns containing the matching path, file name, modality, stored locator (`byte`, `second`, `page`, or `frame`), and the stored `plaintext` snippet for that chunk when available. Use `--range START:END` (0-based, end-exclusive) to return only a subset of results, and `--json` to emit a JSON array instead of tab-separated text. This avoids rerunning Whisper, PDF extraction, or other expensive processing during search.
+
+In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain. The same ignore rules from `--ignore` and `--ignore-file` are applied to watch events before reindexing.
+
+Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
+
+### CLI Options
+
+- `-p, --path PATH`: File or directory to embed recursively (conflicts with `--search`).
+- `--search TEXT`: Query string to vectorize and search semantically (conflicts with `--path`).
+- `--model-dir PATH`: Path to the local model directory (default: `jina-embeddings-v4`).
+- `--task TASK`: Embedding task name (default: `retrieval`).
+- `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
+- `--python PATH`: Path to the Python interpreter (default: `python3`).
+- `--device DEVICE`: Execution device (`auto`, `cpu`, `cuda`, `mps`) (default: `auto`).
+- `--script PATH`: Path to the embedding helper script (default: `scripts/embed.py`).
+- `--limit N`: Maximum number of search results to return (default: `10`).
+- `--range START:END`: Return a subset of search results (0-based, end-exclusive).
+- `--json`: Emit search results as a JSON array instead of tab-separated text.
+- `--translate`: For non-English audio, run a second Whisper pass forced to English.
+- `--ignore PATH`: File or directory name/path to ignore (repeatable).
+- `--ignore-file FILE`: File containing newline-separated ignore entries.
+- `--watch`: Watch for changes and keep the index up to date (requires `--path`).
+
 ## Setup
 
 I would like for Wolfe to be implemented in pure Rust, but currently running the Jina Embeddings V4 model requires the use of a Python wrapper.  Please file a PR or reach out if you know of a way to improve this.  Until then:
@@ -131,76 +201,6 @@ git clone https://huggingface.co/jinaai/jina-embeddings-v4
 ```
 
 or pass `--model-dir`
-
-## Usage
-
-```bash
-cargo run -- --path /path/to/input.txt
-```
-
-Optional:
-
-```bash
-cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 --task retrieval --python python3 --db wolfe.lance
-cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
-cargo run -- --path /path/to/input-or-directory --music --db wolfe.lance
-cargo run -- --path /path/to/input-or-directory --music --low-memory --db wolfe.lance
-```
-
-Flags:
-`--translate` runs a second Whisper pass forced to English for non-English audio.
-`--music` enables the music characterization step for audio/video when music is detected.
-`--low-memory` unloads and reloads Jina, Qwen Omni, and Whisper so only one large model is in VRAM at a time during ingest.
-
-Search:
-
-```bash
-cargo run -- --search "error handling in rust" --db wolfe.lance --limit 10
-cargo run -- --search "error handling in rust" --db wolfe.lance --range 10:20
-cargo run -- --search "error handling in rust" --db wolfe.lance --json
-```
-
-Watch for changes:
-
-```bash
-cargo run -- --path /path/to/input-or-directory --watch --db wolfe.lance
-```
-
-To force a device explicitly:
-
-```bash
-cargo run -- --path /path/to/input-or-directory --device cuda
-```
-
-### CLI Options
-
-- `-p, --path PATH`: File or directory to embed recursively (conflicts with `--search`).
-- `--search TEXT`: Query string to vectorize and search semantically (conflicts with `--path`).
-- `--model-dir PATH`: Path to the local model directory (default: `jina-embeddings-v4`).
-- `--task TASK`: Embedding task name (default: `retrieval`).
-- `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
-- `--python PATH`: Path to the Python interpreter (default: `python3`).
-- `--device DEVICE`: Execution device (`auto`, `cpu`, `cuda`, `mps`) (default: `auto`).
-- `--script PATH`: Path to the embedding helper script (default: `scripts/embed.py`).
-- `--limit N`: Maximum number of search results to return (default: `10`).
-- `--range START:END`: Return a subset of search results (0-based, end-exclusive).
-- `--json`: Emit search results as a JSON array instead of tab-separated text.
-- `--translate`: For non-English audio, run a second Whisper pass forced to English.
-- `--ignore PATH`: File or directory name/path to ignore (repeatable).
-- `--ignore-file FILE`: File containing newline-separated ignore entries.
-- `--watch`: Watch for changes and keep the index up to date (requires `--path`).
-
-When `--path` points at a directory, the CLI traverses it recursively
-
-You can exclude content from both recursive ingest and `--watch` with repeated `--ignore` arguments or with `--ignore-file path/to/list.txt`. Ignore entries may be file or directory names such as `node_modules` or `target`, or explicit relative/absolute paths. Any file with a matching name and anything under any directory with a matching name or path is skipped.
-
-Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `wolfe` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, offset, plaintext, file size, and modified timestamp so search results can be mapped back to files. `offset` is stored in bytes for plain text files, seconds for audio-derived records, pages for PDF-derived records, and frames for video-derived records. `plaintext` stores the text input used to create that chunk's embedding when the modality is text-derived. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
-
-In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Search results are printed to stdout as tab-separated columns containing the matching path, file name, modality, stored locator (`byte`, `second`, `page`, or `frame`), and the stored `plaintext` snippet for that chunk when available. Use `--range START:END` (0-based, end-exclusive) to return only a subset of results, and `--json` to emit a JSON array instead of tab-separated text. This avoids rerunning Whisper, PDF extraction, or other expensive processing during search.
-
-In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain. The same ignore rules from `--ignore` and `--ignore-file` are applied to watch events before reindexing.
-
-Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
 ### Todo
 
