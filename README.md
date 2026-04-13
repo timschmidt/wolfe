@@ -78,10 +78,11 @@ I would like for Wolfe to be implemented in pure Rust, but currently running the
 ### Create a Python venv and install deps
 
 ```bash
-python3.12 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub optimum auto-gptq
+python -m pip install pcre2
+python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub optimum auto-gptq gptqmodel --no-build-isolation
 ```
 
 Install a PyTorch build that matches your hardware:
@@ -95,7 +96,7 @@ python -m pip install torch torchvision
 - NVIDIA CUDA:
 
 ```bash
-python -m pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 - Apple Silicon:
@@ -105,6 +106,22 @@ python -m pip install torch torchvision
 ```
 
 The helper defaults to `--device auto`, which prefers CUDA, then MPS, then CPU.
+
+### Workaround for pcre
+
+Set up this wrapper for pcre2 as pcre in the .venv
+
+```Python
+python - <<'PY'
+import site
+from pathlib import Path
+
+site_dir = next(p for p in site.getsitepackages() if "site-packages" in p)
+shim = Path(site_dir) / "pcre.py"
+shim.write_text("from pcre2 import *\n")
+print("Wrote shim:", shim)
+PY
+```
 
 ### Ensure model files are present
 
