@@ -163,3 +163,6 @@ Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 ### Todo
 
 - implement semantic boundary detection (sliding window?, llm based?)
+- implement multi-threaded pdf decomposition and raster rust-side
+- implement multi-threaded video decomposition rust-side
+- implement multi-threaded document decomposition for LibreOffice, MS Office rust-side
