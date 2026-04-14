@@ -600,6 +600,12 @@ def describe_music(media_path: Path, device: str, qwen_max_memory_mb: int | None
                 use_cache=False,
             )
 
+    input_ids = inputs.get("input_ids")
+    if input_ids is not None and hasattr(input_ids, "shape"):
+        prompt_length = input_ids.shape[-1]
+        if generated_ids.shape[-1] > prompt_length:
+            generated_ids = generated_ids[:, prompt_length:]
+
     description = qwen_processor.tokenizer.batch_decode(
         generated_ids,
         skip_special_tokens=True,
@@ -788,7 +794,6 @@ def build_audio_records(
     task: str,
     device: str,
     translate: bool,
-    music: bool,
     low_memory: bool,
     qwen_max_memory_mb: int | None,
     unload_after: bool = True,
@@ -843,7 +848,7 @@ def build_audio_records(
         if low_memory:
             unload_whisper_model()
 
-    if music and should_characterize_music(class_names):
+    if should_characterize_music(class_names):
         description = ""
         if low_memory:
             embedder.unload()
@@ -1103,7 +1108,6 @@ def build_video_records(
     task: str,
     device: str,
     translate: bool,
-    music: bool,
     low_memory: bool,
     qwen_max_memory_mb: int | None,
     unload_after: bool = True,
@@ -1140,7 +1144,6 @@ def build_video_records(
                 task,
                 device,
                 translate,
-                music,
                 low_memory,
                 qwen_max_memory_mb,
                 unload_after=False,
@@ -1216,11 +1219,6 @@ def parse_args() -> argparse.Namespace:
         help="For non-English audio, run a second Whisper pass forced to English",
     )
     parser.add_argument(
-        "--music",
-        action="store_true",
-        help="Enable music characterization for audio/video when music is detected",
-    )
-    parser.add_argument(
         "--low-memory",
         action="store_true",
         help="Unload and reload models so only one of Jina or Qwen Omni is in VRAM at a time",
@@ -1280,7 +1278,6 @@ def main() -> None:
                     args.task,
                     device,
                     args.translate,
-                    args.music,
                     args.low_memory,
                     args.qwen_max_memory,
                     unload_after=False,
@@ -1309,7 +1306,6 @@ def main() -> None:
                     args.task,
                     device,
                     args.translate,
-                    args.music,
                     args.low_memory,
                     args.qwen_max_memory,
                     unload_after=False,

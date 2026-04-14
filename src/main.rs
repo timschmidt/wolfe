@@ -68,10 +68,6 @@ struct Args {
     #[arg(long)]
     translate: bool,
 
-    /// Enable music characterization when music is detected in audio/video
-    #[arg(long)]
-    music: bool,
-
     /// Max VRAM for Qwen in MB (used with device_map=auto)
     #[arg(long, value_name = "MB")]
     qwen_max_memory: Option<usize>,
@@ -471,7 +467,6 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg("--device")
         .arg(&args.device)
         .args(if args.translate { vec!["--translate"] } else { Vec::new() })
-        .args(if args.music { vec!["--music"] } else { Vec::new() })
         .args(
             args.qwen_max_memory
                 .map(|value| vec!["--qwen-max-memory".to_string(), value.to_string()])
