@@ -340,8 +340,86 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
     )?)
 }
 
+// Keep in sync with README and scripts/embed.py (DOCUMENT_EXTENSIONS).
+const DOCUMENT_EXTENSIONS: &[&str] = &[
+    ".csv",
+    ".dbf",
+    ".dif",
+    ".doc",
+    ".docm",
+    ".docx",
+    ".dot",
+    ".dotm",
+    ".dotx",
+    ".fodg",
+    ".fodp",
+    ".fods",
+    ".fodt",
+    ".htm",
+    ".html",
+    ".mht",
+    ".mhtml",
+    ".odb",
+    ".odc",
+    ".odf",
+    ".odg",
+    ".odm",
+    ".odp",
+    ".ods",
+    ".odt",
+    ".oth",
+    ".otp",
+    ".ots",
+    ".ott",
+    ".otg",
+    ".otm",
+    ".pot",
+    ".potm",
+    ".potx",
+    ".pps",
+    ".ppsm",
+    ".ppsx",
+    ".ppt",
+    ".pptm",
+    ".pptx",
+    ".rtf",
+    ".sda",
+    ".sdc",
+    ".sdd",
+    ".sdw",
+    ".slk",
+    ".sxc",
+    ".sxd",
+    ".sxg",
+    ".sxi",
+    ".sxm",
+    ".sxw",
+    ".tab",
+    ".tsv",
+    ".txt",
+    ".uot",
+    ".uop",
+    ".uos",
+    ".uof",
+    ".vdx",
+    ".vsd",
+    ".vsdx",
+    ".xhtml",
+    ".xls",
+    ".xlsm",
+    ".xlsx",
+    ".xlt",
+    ".xltm",
+    ".xltx",
+    ".xml",
+];
+
+fn is_document_extension(extension: &str) -> bool {
+    DOCUMENT_EXTENSIONS.contains(&extension)
+}
+
 fn snippet_unit(modality: &str, extension: &str) -> &'static str {
-    if extension == ".pdf" {
+    if extension == ".pdf" || is_document_extension(extension) {
         return "page";
     }
     if matches!(extension, ".mp4" | ".mkv" | ".mov" | ".avi" | ".m4v" | ".mpeg" | ".mpg" | ".ts" | ".webm") {
@@ -357,7 +435,7 @@ fn snippet_unit(modality: &str, extension: &str) -> &'static str {
 }
 
 fn display_offset(extension: &str, offset: u64) -> u64 {
-    if extension == ".pdf" {
+    if extension == ".pdf" || is_document_extension(extension) {
         offset + 1
     } else {
         offset

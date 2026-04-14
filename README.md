@@ -10,6 +10,7 @@ Local only, 100% offline, your data stays on your computer.
 
 - Text: UTF-8 text files
 - PDF: `.pdf`
+- Document: `.csv` `.dbf` `.dif` `.doc` `.docm` `.docx` `.dot` `.dotm` `.dotx` `.fodg` `.fodp` `.fods` `.fodt` `.htm` `.html` `.mht` `.mhtml` `.odb` `.odc` `.odf` `.odg` `.odm` `.odp` `.ods` `.odt` `.oth` `.otp` `.ots` `.ott` `.otg` `.otm` `.pot` `.potm` `.potx` `.pps` `.ppsm` `.ppsx` `.ppt` `.pptm` `.pptx` `.rtf` `.sda` `.sdc` `.sdd` `.sdw` `.slk` `.sxc` `.sxd` `.sxg` `.sxi` `.sxm` `.sxw` `.tab` `.tsv` `.txt` `.uot` `.uop` `.uos` `.uof` `.vdx` `.vsd` `.vsdx` `.xhtml` `.xls` `.xlsm` `.xlsx` `.xlt` `.xltm` `.xltx` `.xml`
 - Images: `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`
 - Audio: `.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`, `.webm`
 - Video: `.avi`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.ts`, `.webm`
@@ -26,6 +27,8 @@ flowchart TD
     T2 --> T3[Store Text Records]
 
     B -->|PDF| P[Extract PDF Text]
+    B -->|Document| D[Convert to PDF via LibreOffice]
+    D --> P
     P --> P1[Chunk Text]
     P1 --> P2[Embed Text Chunks]
     P2 --> P3[Store Text Records]
@@ -113,9 +116,10 @@ In search mode, the query string is embedded by the same Python model helper and
 
 In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain. The same ignore rules from `--ignore` and `--ignore-file` are applied to watch events before reindexing.
 
-Documents supported by LibreOffice (for example `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods`, `.odp`, `.rtf`) are converted to PDF via `soffice --headless --convert-to pdf` and then ingested through the existing PDF pipeline (text extraction plus per-page images).
+LibreOffice-supported document formats are converted to PDF via `soffice --headless --convert-to pdf` and then ingested through the existing PDF pipeline (text extraction plus per-page images). The original file path/name is preserved, but offsets are treated as pages because the ingest happens through the PDF parser.
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
+
 Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`.
 
 ### CLI Options

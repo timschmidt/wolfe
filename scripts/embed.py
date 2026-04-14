@@ -42,6 +42,79 @@ IMAGE_EXTENSIONS = {
     ".webp",
 }
 PDF_EXTENSIONS = {".pdf"}
+# Keep in sync with README and src/main.rs (DOCUMENT_EXTENSIONS).
+DOCUMENT_EXTENSIONS = {
+    ".csv",
+    ".dbf",
+    ".dif",
+    ".doc",
+    ".docm",
+    ".docx",
+    ".dot",
+    ".dotm",
+    ".dotx",
+    ".fodg",
+    ".fodp",
+    ".fods",
+    ".fodt",
+    ".htm",
+    ".html",
+    ".mht",
+    ".mhtml",
+    ".odb",
+    ".odc",
+    ".odf",
+    ".odg",
+    ".odm",
+    ".odp",
+    ".ods",
+    ".odt",
+    ".oth",
+    ".otp",
+    ".ots",
+    ".ott",
+    ".otg",
+    ".otm",
+    ".pot",
+    ".potm",
+    ".potx",
+    ".pps",
+    ".ppsm",
+    ".ppsx",
+    ".ppt",
+    ".pptm",
+    ".pptx",
+    ".rtf",
+    ".sda",
+    ".sdc",
+    ".sdd",
+    ".sdw",
+    ".slk",
+    ".sxc",
+    ".sxd",
+    ".sxg",
+    ".sxi",
+    ".sxm",
+    ".sxw",
+    ".tab",
+    ".tsv",
+    ".txt",
+    ".uot",
+    ".uop",
+    ".uos",
+    ".uof",
+    ".vdx",
+    ".vsd",
+    ".vsdx",
+    ".xhtml",
+    ".xls",
+    ".xlsm",
+    ".xlsx",
+    ".xlt",
+    ".xltm",
+    ".xltx",
+    ".xml",
+}
 AUDIO_EXTENSIONS = {
     ".aac",
     ".flac",
@@ -142,6 +215,10 @@ def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
 
 
+def is_document_file(path: Path) -> bool:
+    return path.suffix.lower() in DOCUMENT_EXTENSIONS
+
+
 def has_video_stream(path: Path) -> bool:
     try:
         streams = ffprobe_streams(path)
@@ -165,17 +242,15 @@ def build_record(
     chunk: int,
     offset: int = 0,
     plaintext: str = "",
-    extension_override: str | None = None,
 ) -> dict[str, object]:
     stat = file_path.stat()
     resolved_path = file_path.resolve().as_posix()
-    extension = extension_override or file_path.suffix.lower()
     return {
         "status": "ok",
         "record_id": f"{resolved_path}#{chunk}",
         "path": resolved_path,
         "file_name": file_path.name,
-        "extension": extension,
+        "extension": file_path.suffix.lower(),
         "parent_dir": file_path.parent.resolve().as_posix(),
         "modality": modality,
         "chunk": chunk,
@@ -720,7 +795,6 @@ def build_text_records(
     offset_fn=None,
     low_memory: bool = False,
     unload_after: bool = True,
-    extension_override: str | None = None,
 ) -> list[dict[str, object]]:
     text_embeddings = encode_text_chunks(embedder, text, task, TOKEN_CHUNK_LIMIT)
     records: list[dict[str, object]] = []
@@ -736,7 +810,6 @@ def build_text_records(
                 chunk_index,
                 offset_fn(char_offset),
                 normalize_snippet_text(chunk_text_value),
-                extension_override=extension_override,
             )
         )
 
@@ -813,7 +886,6 @@ def build_pdf_records_from_source(
 ) -> list[dict[str, object]]:
     page_texts, page_images = extract_pdf_content(pdf_path)
     records: list[dict[str, object]] = []
-    extension_override = ".pdf"
 
     for page_index, page_text in page_texts:
         if page_text.strip():
@@ -825,7 +897,6 @@ def build_pdf_records_from_source(
                 offset_fn=lambda _char_offset, page_index=page_index: page_index,
                 low_memory=low_memory,
                 unload_after=False,
-                extension_override=extension_override,
             )
             records.extend(offset_record_chunks(page_records, len(records)))
 
@@ -847,7 +918,6 @@ def build_pdf_records_from_source(
                 embedding,
                 len(records),
                 page_index,
-                extension_override=extension_override,
             )
         )
 
@@ -1407,6 +1477,38 @@ def main() -> None:
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
                 continue
 
+            if is_document_file(file_path):
+                pdf_path = None
+                tmpdir = None
+                reason = None
+                try:
+                    pdf_path, tmpdir, reason = convert_document_to_pdf(file_path)
+                    if pdf_path:
+                        for record in build_pdf_records_from_source(
+                            embedder,
+                            file_path,
+                            pdf_path,
+                            args.task,
+                            args.low_memory,
+                            unload_after=False,
+                        ):
+                            emit_json(record)
+                        emit_json({"status": "done", "path": file_path.resolve().as_posix()})
+                        continue
+                finally:
+                    if tmpdir is not None:
+                        tmpdir.cleanup()
+
+                emit_json(
+                    {
+                        "status": "skipped",
+                        "path": file_path.resolve().as_posix(),
+                        "reason": reason or "libreoffice_conversion_failed",
+                    }
+                )
+                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
+                continue
+
             if is_audio_file(file_path):
                 for record in build_audio_records(
                     embedder,
@@ -1440,32 +1542,11 @@ def main() -> None:
 
             text = read_text_file(file_path)
             if text is None:
-                pdf_path = None
-                tmpdir = None
-                reason = None
-                try:
-                    pdf_path, tmpdir, reason = convert_document_to_pdf(file_path)
-                    if pdf_path:
-                        for record in build_pdf_records_from_source(
-                            embedder,
-                            file_path,
-                            pdf_path,
-                            args.task,
-                            args.low_memory,
-                            unload_after=False,
-                        ):
-                            emit_json(record)
-                        emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                        continue
-                finally:
-                    if tmpdir is not None:
-                        tmpdir.cleanup()
-
                 emit_json(
                     {
                         "status": "skipped",
                         "path": file_path.resolve().as_posix(),
-                        "reason": reason or "unsupported_file_type",
+                        "reason": "unsupported_file_type",
                     }
                 )
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})
