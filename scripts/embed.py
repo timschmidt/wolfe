@@ -42,8 +42,8 @@ IMAGE_EXTENSIONS = {
     ".webp",
 }
 PDF_EXTENSIONS = {".pdf"}
-# Keep in sync with README and src/main.rs (DOCUMENT_EXTENSIONS).
-DOCUMENT_EXTENSIONS = {
+# Default set; overridden at runtime via --document-extensions passed from Rust.
+DEFAULT_DOCUMENT_EXTENSIONS = {
     ".csv",
     ".dbf",
     ".dif",
@@ -213,6 +213,9 @@ def is_audio_file(path: Path) -> bool:
 
 def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+DOCUMENT_EXTENSIONS: set[str] = set(DEFAULT_DOCUMENT_EXTENSIONS)
 
 
 def is_document_file(path: Path) -> bool:
@@ -1407,11 +1410,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Max VRAM for Qwen in MB (used with device_map=auto)",
     )
+    parser.add_argument(
+        "--document-extensions",
+        help="Comma-separated list of document extensions used for LibreOffice conversion",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.document_extensions:
+        extensions = {ext.strip().lower() for ext in args.document_extensions.split(",") if ext.strip()}
+        if extensions:
+            global DOCUMENT_EXTENSIONS
+            DOCUMENT_EXTENSIONS = extensions
     device = detect_device(args.device)
     embedder = JinaEmbedder(args.model_dir, device)
     embedder.load()

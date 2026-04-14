@@ -340,7 +340,7 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
     )?)
 }
 
-// Keep in sync with README and scripts/embed.py (DOCUMENT_EXTENSIONS).
+// Source of truth for document extensions passed to the Python worker.
 const DOCUMENT_EXTENSIONS: &[&str] = &[
     ".csv",
     ".dbf",
@@ -416,6 +416,10 @@ const DOCUMENT_EXTENSIONS: &[&str] = &[
 
 fn is_document_extension(extension: &str) -> bool {
     DOCUMENT_EXTENSIONS.contains(&extension)
+}
+
+fn document_extensions_arg() -> String {
+    DOCUMENT_EXTENSIONS.join(",")
 }
 
 fn snippet_unit(modality: &str, extension: &str) -> &'static str {
@@ -544,6 +548,8 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg(&args.task)
         .arg("--device")
         .arg(&args.device)
+        .arg("--document-extensions")
+        .arg(document_extensions_arg())
         .args(if args.translate { vec!["--translate"] } else { Vec::new() })
         .args(
             args.qwen_max_memory
