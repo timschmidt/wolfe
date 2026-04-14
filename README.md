@@ -87,12 +87,6 @@ cargo run -- --path /path/to/input-or-directory --low-memory --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --low-memory --qwen-max-memory 6000 --db wolfe.lance
 ```
 
-Flags:
-`--translate` runs a second Whisper pass forced to English for non-English audio.
-`--low-memory` unloads and reloads Jina, Qwen Omni, and Whisper so only one large model is in VRAM at a time during ingest.
-`--qwen-max-memory` caps Qwen's GPU usage (in MB) when `device_map=auto` is used; lower values offload more to CPU.
-Music characterization runs automatically when music is detected in audio/video.
-
 Search:
 
 ```bash
@@ -112,10 +106,6 @@ To force a device explicitly:
 ```bash
 cargo run -- --path /path/to/input-or-directory --device cuda
 ```
-
-When `--path` points at a directory, the CLI traverses it recursively
-
-You can exclude content from both recursive ingest and `--watch` with repeated `--ignore` arguments or with `--ignore-file path/to/list.txt`. Ignore entries may be file or directory names such as `node_modules` or `target`, or explicit relative/absolute paths. Any file with a matching name and anything under any directory with a matching name or path is skipped.
 
 Embeddings are stored in `wolfe.lance` by default. If `--db` ends with `.lance`, that path is treated as the final Lance table location; otherwise the table name defaults to `wolfe` under the given database directory. Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, offset, plaintext, file size, and modified timestamp so search results can be mapped back to files. `offset` is stored in bytes for plain text files, seconds for audio-derived records, pages for PDF-derived records, and frames for video-derived records. `plaintext` stores the text input used to create that chunk's embedding when the modality is text-derived. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
 
@@ -139,6 +129,8 @@ Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 - `--range START:END`: Return a subset of search results (0-based, end-exclusive).
 - `--json`: Emit search results as a JSON array instead of tab-separated text.
 - `--translate`: For non-English audio, run a second Whisper pass forced to English.
+- `--low-memory`: Unload/reload Jina, Qwen Omni, and Whisper so only one large model is in VRAM at a time during ingest.
+- `--qwen-max-memory MB`: Cap Qwen's GPU usage (MB) when `device_map=auto` is used; lower values offload more to CPU.
 - `--ignore PATH`: File or directory name/path to ignore (repeatable).
 - `--ignore-file FILE`: File containing newline-separated ignore entries.
 - `--watch`: Watch for changes and keep the index up to date (requires `--path`).
