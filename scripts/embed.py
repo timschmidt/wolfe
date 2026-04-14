@@ -165,15 +165,17 @@ def build_record(
     chunk: int,
     offset: int = 0,
     plaintext: str = "",
+    extension_override: str | None = None,
 ) -> dict[str, object]:
     stat = file_path.stat()
     resolved_path = file_path.resolve().as_posix()
+    extension = extension_override or file_path.suffix.lower()
     return {
         "status": "ok",
         "record_id": f"{resolved_path}#{chunk}",
         "path": resolved_path,
         "file_name": file_path.name,
-        "extension": file_path.suffix.lower(),
+        "extension": extension,
         "parent_dir": file_path.parent.resolve().as_posix(),
         "modality": modality,
         "chunk": chunk,
@@ -718,6 +720,7 @@ def build_text_records(
     offset_fn=None,
     low_memory: bool = False,
     unload_after: bool = True,
+    extension_override: str | None = None,
 ) -> list[dict[str, object]]:
     text_embeddings = encode_text_chunks(embedder, text, task, TOKEN_CHUNK_LIMIT)
     records: list[dict[str, object]] = []
@@ -733,6 +736,7 @@ def build_text_records(
                 chunk_index,
                 offset_fn(char_offset),
                 normalize_snippet_text(chunk_text_value),
+                extension_override=extension_override,
             )
         )
 
@@ -797,6 +801,99 @@ def build_pdf_records(
     if low_memory and unload_after:
         embedder.unload()
     return records
+
+
+def build_pdf_records_from_source(
+    embedder: JinaEmbedder,
+    source_path: Path,
+    pdf_path: Path,
+    task: str,
+    low_memory: bool,
+    unload_after: bool = True,
+) -> list[dict[str, object]]:
+    page_texts, page_images = extract_pdf_content(pdf_path)
+    records: list[dict[str, object]] = []
+    extension_override = ".pdf"
+
+    for page_index, page_text in page_texts:
+        if page_text.strip():
+            page_records = build_text_records(
+                embedder,
+                source_path,
+                page_text,
+                task,
+                offset_fn=lambda _char_offset, page_index=page_index: page_index,
+                low_memory=low_memory,
+                unload_after=False,
+                extension_override=extension_override,
+            )
+            records.extend(offset_record_chunks(page_records, len(records)))
+
+    for page_index, page_image in page_images:
+        embedder.load()
+        model = embedder.model
+        if model is None:
+            raise RuntimeError("embedding model failed to load")
+        with torch.inference_mode():
+            embedding = model.encode_image(images=page_image, task=task)
+
+        if hasattr(embedding, "detach"):
+            embedding = embedding.detach().cpu().tolist()
+
+        records.append(
+            build_record(
+                source_path,
+                "image",
+                embedding,
+                len(records),
+                page_index,
+                extension_override=extension_override,
+            )
+        )
+
+    if low_memory and unload_after:
+        embedder.unload()
+    return records
+
+
+def convert_document_to_pdf(path: Path) -> tuple[Path | None, tempfile.TemporaryDirectory | None, str | None]:
+    soffice_path = shutil.which("soffice")
+    if not soffice_path:
+        return None, None, "libreoffice_missing"
+
+    tmpdir = tempfile.TemporaryDirectory()
+    outdir = Path(tmpdir.name)
+    try:
+        result = subprocess.run(
+            [
+                soffice_path,
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                outdir.as_posix(),
+                path.as_posix(),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except Exception:
+        tmpdir.cleanup()
+        return None, None, "libreoffice_conversion_failed"
+
+    expected_name = path.with_suffix(".pdf").name
+    pdf_path = outdir / expected_name
+    if not pdf_path.exists():
+        pdf_candidates = list(outdir.glob("*.pdf"))
+        if pdf_candidates:
+            pdf_path = pdf_candidates[0]
+
+    if not pdf_path.exists():
+        tmpdir.cleanup()
+        return None, None, "libreoffice_conversion_failed"
+
+    return pdf_path, tmpdir, None
 
 
 def build_audio_records(
@@ -1343,11 +1440,32 @@ def main() -> None:
 
             text = read_text_file(file_path)
             if text is None:
+                pdf_path = None
+                tmpdir = None
+                reason = None
+                try:
+                    pdf_path, tmpdir, reason = convert_document_to_pdf(file_path)
+                    if pdf_path:
+                        for record in build_pdf_records_from_source(
+                            embedder,
+                            file_path,
+                            pdf_path,
+                            args.task,
+                            args.low_memory,
+                            unload_after=False,
+                        ):
+                            emit_json(record)
+                        emit_json({"status": "done", "path": file_path.resolve().as_posix()})
+                        continue
+                finally:
+                    if tmpdir is not None:
+                        tmpdir.cleanup()
+
                 emit_json(
                     {
                         "status": "skipped",
                         "path": file_path.resolve().as_posix(),
-                        "reason": "unsupported_file_type",
+                        "reason": reason or "unsupported_file_type",
                     }
                 )
                 emit_json({"status": "done", "path": file_path.resolve().as_posix()})

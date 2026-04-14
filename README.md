@@ -113,7 +113,10 @@ In search mode, the query string is embedded by the same Python model helper and
 
 In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain. The same ignore rules from `--ignore` and `--ignore-file` are applied to watch events before reindexing.
 
+Documents supported by LibreOffice (for example `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods`, `.odp`, `.rtf`) are converted to PDF via `soffice --headless --convert-to pdf` and then ingested through the existing PDF pipeline (text extraction plus per-page images).
+
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
+Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`.
 
 ### CLI Options
 
