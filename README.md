@@ -1,7 +1,5 @@
 # Wolfe
-Multimodal semantic file search using Jina Embeddings V4, YAMNet, Qwen2.5 Omni 7B, and Whisper Large V3
-
-For intelligently investigating your files
+Multimodal semantic file search for intelligently investigating your files
 
 Local only, 100% offline, your data stays on your computer.
 
