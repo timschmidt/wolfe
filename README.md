@@ -1,10 +1,14 @@
 # Wolfe
-
 Multimodal semantic file search using Jina Embeddings V4, YAMNet, Qwen2.5 Omni 7B, and Whisper Large V3
 
 For intelligently investigating your files
 
 Local only, 100% offline, your data stays on your computer.
+
+# How it works
+Wolfe uses LibreOffice, ffmpeg, and mupdf to decompose almost any file into streams of audio, text, and images.  Audio streams are processed through YAMNet to identify audio events and type.  When speech is detected, an additional processing step through Whisper Large v3 is used to transcribe and optionally translate it to text.  When music is detected, an additional processing step through Qwen 2.5 Omni 7B is used to characterize and describe the music in text.  The resulting streams of images and text are passed through Jina Embedding v4 to generate the embeddings stored in the database with file metadata.
+
+Search text is passed through Jina Embedding v4 to produce an embedding.  When queried with the search embedding, the database returns the closest matches and their associated metadata.
 
 ### Supported File Types
 
@@ -110,13 +114,9 @@ To force a device explicitly:
 cargo run -- --path /path/to/input-or-directory --device cuda
 ```
 
-Embeddings are stored in `wolfe.lance` by default.  Each row includes the vector plus metadata such as absolute file path, file name, extension, parent directory, modality, chunk number, offset, plaintext, file size, and modified timestamp so search results can be mapped back to files. `offset` is stored in bytes for plain text files, seconds for audio-derived records, pages for PDF-derived records, and frames for video-derived records. `plaintext` stores the text input used to create that chunk's embedding when the modality is text-derived. The Python helper stays alive for the whole run, so the model is loaded onto the selected device only once.
+Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`.
 
-In search mode, the query string is embedded by the same Python model helper and searched against the stored vectors in LanceDB. Search results are printed to stdout as tab-separated columns containing the matching path, file name, modality, stored locator (`byte`, `second`, `page`, or `frame`), and the stored `plaintext` snippet for that chunk when available. Use `--range START:END` (0-based, end-exclusive) to return only a subset of results, and `--json` to emit a JSON array instead of tab-separated text. This avoids rerunning Whisper, PDF extraction, or other expensive processing during search.
-
-In `--watch` mode on Linux, Wolfe uses the platform `notify` backend, which is `inotify`, to monitor the target path continuously. Changed and newly created files are reindexed, and removed files are deleted from the database. Existing records for a file are deleted before reindexing so stale chunk rows do not remain. The same ignore rules from `--ignore` and `--ignore-file` are applied to watch events before reindexing.
-
-LibreOffice-supported document formats are converted to PDF via `soffice --headless --convert-to pdf` and then ingested through the existing PDF pipeline (text extraction plus per-page images).  Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`.
+Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
 Music characterization runs when YAMNet flags audio as music. Wolfe sends the audio to Qwen Omni and stores the response as additional audio-derived text chunks for search. The prompt used is:
 
@@ -135,8 +135,6 @@ Similar works: ""
 
 (Progression means how the song evolves or if there are notable changes or moments.)
 ```
-
-Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
 ### CLI Options
 
