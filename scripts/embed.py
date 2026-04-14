@@ -608,7 +608,7 @@ def describe_music(media_path: Path, device: str, qwen_max_memory_mb: int | None
         with torch.inference_mode():
             generated_ids = qwen_model.generate(
                 **inputs,
-                max_new_tokens=256,
+                max_new_tokens=512,
                 use_cache=False,
             )
 
