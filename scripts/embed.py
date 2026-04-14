@@ -572,7 +572,19 @@ def transcribe_audio(media_path: Path, device: str, language: str | None = None)
 def describe_music(media_path: Path, device: str, qwen_max_memory_mb: int | None) -> str:
     qwen_model, qwen_processor = load_qwen_omni_model(device, qwen_max_memory_mb)
     waveform = load_audio_waveform(media_path)
-    prompt = "Please identify genre, instrumentation, mood, and similar works to the attached music."
+    prompt = (
+        "Fill out this profile about the music you hear. Be thorough.\n\n"
+        'Instrumentation/Vocals: ""\n'
+        'Soundscape: ""\n'
+        'Mood: ""\n'
+        'Genre: ""\n'
+        'Style: ""\n'
+        'Description: ""\n'
+        'Comment: ""\n'
+        'Progression: ""\n'
+        'Similar works: ""\n\n'
+        "(Progression means how the song evolves or if there are notable changes or moments.)"
+    )
 
     messages = [
         {
