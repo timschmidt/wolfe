@@ -1088,6 +1088,7 @@ def build_cad_records(
         ("right", "-X", "+Y"),
         ("top", "-Y", "+Z"),
         ("bottom", "+Y", "-Z"),
+        ("isometric", "-1,-1,-1", "+Y"),
     )
 
     with tempfile.TemporaryDirectory(prefix="wolfe-cad-") as temp_dir_name:

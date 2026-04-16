@@ -43,7 +43,7 @@ flowchart TD
     C --> C1[Extract F3D Text Metadata]
     C1 --> C2[Embed Metadata Text]
     C2 --> C3[Store CAD Text Records]
-    C --> C4[Render Cardinal Views]
+    C --> C4[Render Cardinal + Isometric Views]
     C4 --> C5[Embed View Images]
     C5 --> C6[Store CAD Image Records]
 
@@ -137,7 +137,7 @@ Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOf
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
-CAD ingestion requires `f3d` to be available on `PATH` with an offscreen rendering backend capable of writing `--output` images. Wolfe extracts text metadata from `f3d --no-render --verbose=debug` output and renders centered orthographic views from the front, back, left, right, top, and bottom directions. If F3D is installed but cannot render offscreen on your machine, CAD files will fail ingest with an F3D backend error.
+CAD ingestion requires `f3d` to be available on `PATH` with an offscreen rendering backend capable of writing `--output` images. Wolfe extracts text metadata from `f3d --no-render --verbose=debug` output and renders centered orthographic views from the front, back, left, right, top, bottom, and isometric directions. The isometric render uses a corner-facing camera aimed toward the model center. If F3D is installed but cannot render offscreen on your machine, CAD files will fail ingest with an F3D backend error.
 
 Music characterization runs when YAMNet flags audio as music. Wolfe sends the audio to Qwen Omni and stores the response as additional audio-derived text chunks for search. The prompt used is:
 
