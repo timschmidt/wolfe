@@ -72,7 +72,7 @@ struct Args {
     #[arg(long, value_name = "MB")]
     qwen_max_memory: Option<usize>,
 
-    /// Unload and reload models so only one of Jina or Qwen Omni is in VRAM at a time
+    /// Keep only one large PyTorch model in VRAM at a time and force YAMNet onto CPU
     #[arg(long)]
     low_memory: bool,
 
@@ -91,7 +91,6 @@ struct Args {
 
 #[derive(Debug, Deserialize)]
 struct WorkerRecord {
-    status: String,
     record_id: Option<String>,
     path: String,
     file_name: Option<String>,
@@ -112,12 +111,6 @@ struct QueryRecord {
     status: String,
     embedding: Option<Vec<f32>>,
     reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DoneRecord {
-    status: String,
-    path: String,
 }
 
 #[derive(Debug)]
@@ -404,6 +397,7 @@ const DOCUMENT_EXTENSIONS: &[&str] = &[
     ".vdx",
     ".vsd",
     ".vsdx",
+    ".svg",
     ".xhtml",
     ".xls",
     ".xlsm",
@@ -426,10 +420,10 @@ fn snippet_unit(modality: &str, extension: &str) -> &'static str {
     if extension == ".pdf" || is_document_extension(extension) {
         return "page";
     }
-    if matches!(extension, ".mp4" | ".mkv" | ".mov" | ".avi" | ".m4v" | ".mpeg" | ".mpg" | ".ts" | ".webm") {
+    if matches!(extension, ".3gp" | ".mp4" | ".m2ts" | ".mkv" | ".mov" | ".avi" | ".m4v" | ".mpeg" | ".mpg" | ".ts" | ".webm") {
         return "frame";
     }
-    if modality == "audio" || matches!(extension, ".aac" | ".flac" | ".m4a" | ".mp3" | ".ogg" | ".opus" | ".wav") {
+    if modality == "audio" || matches!(extension, ".aac" | ".aif" | ".aiff" | ".au" | ".flac" | ".m4a" | ".mp3" | ".ogg" | ".opus" | ".wav") {
         return "second";
     }
     if modality == "text" {
@@ -639,7 +633,6 @@ async fn ingest_single_path(
                 eprintln!("{}: {}", record.path, reason);
             }
             "done" => {
-                let _: DoneRecord = serde_json::from_value(value)?;
                 break;
             }
             other => return Err(format!("unknown worker status: {other}").into()),

@@ -3,16 +3,23 @@ import argparse
 import csv
 import gc
 import json
+import mailbox
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import contextlib
 import sys
 import tempfile
+import zipfile
+import tarfile
 from datetime import UTC, datetime
+from email import policy
+from email.parser import BytesParser
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from html import unescape as html_unescape
 
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
@@ -32,91 +39,25 @@ from transformers.utils.hub import cached_file
 
 
 IMAGE_EXTENSIONS = {
+    ".avif",
     ".bmp",
     ".gif",
+    ".heic",
+    ".heif",
     ".jpeg",
     ".jpg",
     ".png",
+    ".psd",
     ".tif",
     ".tiff",
     ".webp",
 }
 PDF_EXTENSIONS = {".pdf"}
-# Default set; overridden at runtime via --document-extensions passed from Rust.
-DEFAULT_DOCUMENT_EXTENSIONS = {
-    ".csv",
-    ".dbf",
-    ".dif",
-    ".doc",
-    ".docm",
-    ".docx",
-    ".dot",
-    ".dotm",
-    ".dotx",
-    ".fodg",
-    ".fodp",
-    ".fods",
-    ".fodt",
-    ".htm",
-    ".html",
-    ".mht",
-    ".mhtml",
-    ".odb",
-    ".odc",
-    ".odf",
-    ".odg",
-    ".odm",
-    ".odp",
-    ".ods",
-    ".odt",
-    ".oth",
-    ".otp",
-    ".ots",
-    ".ott",
-    ".otg",
-    ".otm",
-    ".pot",
-    ".potm",
-    ".potx",
-    ".pps",
-    ".ppsm",
-    ".ppsx",
-    ".ppt",
-    ".pptm",
-    ".pptx",
-    ".rtf",
-    ".sda",
-    ".sdc",
-    ".sdd",
-    ".sdw",
-    ".slk",
-    ".sxc",
-    ".sxd",
-    ".sxg",
-    ".sxi",
-    ".sxm",
-    ".sxw",
-    ".tab",
-    ".tsv",
-    ".txt",
-    ".uot",
-    ".uop",
-    ".uos",
-    ".uof",
-    ".vdx",
-    ".vsd",
-    ".vsdx",
-    ".xhtml",
-    ".xls",
-    ".xlsm",
-    ".xlsx",
-    ".xlt",
-    ".xltm",
-    ".xltx",
-    ".xml",
-}
 AUDIO_EXTENSIONS = {
     ".aac",
+    ".aif",
+    ".aiff",
+    ".au",
     ".flac",
     ".m4a",
     ".mp3",
@@ -126,8 +67,10 @@ AUDIO_EXTENSIONS = {
     ".webm",
 }
 VIDEO_EXTENSIONS = {
+    ".3gp",
     ".avi",
     ".m4v",
+    ".m2ts",
     ".mkv",
     ".mov",
     ".mp4",
@@ -152,6 +95,29 @@ CAD_EXTENSIONS = {
     ".vtu",
     ".wrl",
     ".x3d",
+}
+FITZ_DOCUMENT_EXTENSIONS = {
+    ".djvu",
+    ".epub",
+    ".ps",
+}
+SQLITE_EXTENSIONS = {
+    ".db3",
+    ".sqlite",
+    ".sqlite3",
+}
+NOTEBOOK_EXTENSIONS = {
+    ".ipynb",
+}
+ARCHIVE_EXTENSIONS = {
+    ".7z",
+    ".cbz",
+    ".cbr",
+    ".tar",
+    ".tbz2",
+    ".tgz",
+    ".txz",
+    ".zip",
 }
 TOKEN_CHUNK_LIMIT = 20000
 MIN_TOKEN_CHUNK_LIMIT = 1000
@@ -207,6 +173,7 @@ _WHISPER_PROCESSOR = None
 _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
 _QWEN_DEVICE_MAP_AUTO = False
+_ACTIVE_VRAM_MODEL = None
 
 
 def read_text_file(path: Path) -> str | None:
@@ -236,7 +203,28 @@ def is_cad_file(path: Path) -> bool:
     return path.suffix.lower() in CAD_EXTENSIONS
 
 
-DOCUMENT_EXTENSIONS: set[str] = set(DEFAULT_DOCUMENT_EXTENSIONS)
+def is_fitz_document_file(path: Path) -> bool:
+    return path.suffix.lower() in FITZ_DOCUMENT_EXTENSIONS
+
+
+def is_sqlite_file(path: Path) -> bool:
+    return path.suffix.lower() in SQLITE_EXTENSIONS
+
+
+def is_notebook_file(path: Path) -> bool:
+    return path.suffix.lower() in NOTEBOOK_EXTENSIONS
+
+
+def is_archive_file(path: Path) -> bool:
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    if not suffixes:
+        return False
+    joined = "".join(suffixes[-2:])
+    return path.suffix.lower() in ARCHIVE_EXTENSIONS or joined in {".tar.gz", ".tar.bz2", ".tar.xz"}
+
+
+# Source of truth is provided by Rust via --document-extensions at startup.
+DOCUMENT_EXTENSIONS: set[str] = set()
 
 
 def is_document_file(path: Path) -> bool:
@@ -284,6 +272,40 @@ def build_record(
         "modified_at": iso_utc_timestamp(stat.st_mtime),
         "embedding": embedding,
     }
+
+
+def virtualize_records(records: list[dict[str, object]], virtual_path: str) -> list[dict[str, object]]:
+    virtual = PurePosixPath(virtual_path)
+    parent_dir = virtual.parent.as_posix() if virtual.parent.as_posix() != "." else ""
+    extension = virtual.suffix.lower()
+    file_name = virtual.name or virtual_path
+
+    for record in records:
+        record["path"] = virtual_path
+        record["file_name"] = file_name
+        record["extension"] = extension
+        record["parent_dir"] = parent_dir
+        record["record_id"] = f"{virtual_path}#{record['chunk']}"
+    return records
+
+
+def normalize_plaintext(text: str) -> str:
+    return normalize_snippet_text(html_unescape(text))
+
+
+def strip_html_tags(text: str) -> str:
+    without_scripts = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    without_tags = re.sub(r"<[^>]+>", " ", without_scripts)
+    return normalize_plaintext(without_tags)
+
+
+def build_virtual_path(container_display_path: str, relative_path: str) -> str:
+    relative = relative_path.replace("\\", "/").strip("/")
+    return f"{container_display_path}!/{relative}" if relative else container_display_path
+
+
+def sql_identifier(name: str) -> str:
+    return f'"{name.replace(chr(34), chr(34) * 2)}"'
 
 
 def emit_json(payload: dict[str, object]) -> None:
@@ -411,9 +433,17 @@ def load_whisper_model(device: str):
 
 
 def unload_whisper_model() -> None:
+    global _ACTIVE_VRAM_MODEL
     global _WHISPER_MODEL, _WHISPER_PROCESSOR
+    if _WHISPER_MODEL is not None:
+        try:
+            _WHISPER_MODEL.to("cpu")
+        except Exception:
+            pass
     _WHISPER_MODEL = None
     _WHISPER_PROCESSOR = None
+    if _ACTIVE_VRAM_MODEL == "whisper":
+        _ACTIVE_VRAM_MODEL = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -424,7 +454,6 @@ def load_qwen_omni_model(device: str, qwen_max_memory_mb: int | None):
     if _QWEN_MODEL is not None and _QWEN_PROCESSOR is not None:
         return _QWEN_MODEL, _QWEN_PROCESSOR
 
-    model_dtype = torch.float16 if device == "cuda" else torch.float32
     if "GPTQ" in QWEN_OMNI_MODEL_ID.upper():
         try:
             config_path = cached_file(QWEN_OMNI_MODEL_ID, "config.json", local_files_only=True)
@@ -491,6 +520,7 @@ def load_qwen_omni_model(device: str, qwen_max_memory_mb: int | None):
 
 
 def unload_qwen_omni_model() -> None:
+    global _ACTIVE_VRAM_MODEL
     global _QWEN_MODEL, _QWEN_PROCESSOR
     global _QWEN_DEVICE_MAP_AUTO
     if _QWEN_MODEL is not None and not _QWEN_DEVICE_MAP_AUTO:
@@ -501,6 +531,8 @@ def unload_qwen_omni_model() -> None:
     _QWEN_MODEL = None
     _QWEN_PROCESSOR = None
     _QWEN_DEVICE_MAP_AUTO = False
+    if _ACTIVE_VRAM_MODEL == "qwen":
+        _ACTIVE_VRAM_MODEL = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -537,6 +569,7 @@ class JinaEmbedder:
         self.processor = processor
 
     def unload(self) -> None:
+        global _ACTIVE_VRAM_MODEL
         if self.model is None and self.processor is None:
             return
         if self.model is not None:
@@ -546,9 +579,49 @@ class JinaEmbedder:
                 pass
         self.model = None
         self.processor = None
+        if _ACTIVE_VRAM_MODEL == "jina":
+            _ACTIVE_VRAM_MODEL = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def ensure_jina_loaded(embedder: JinaEmbedder, low_memory: bool) -> None:
+    global _ACTIVE_VRAM_MODEL
+    if low_memory and _ACTIVE_VRAM_MODEL != "jina":
+        if _ACTIVE_VRAM_MODEL == "whisper":
+            unload_whisper_model()
+        elif _ACTIVE_VRAM_MODEL == "qwen":
+            unload_qwen_omni_model()
+    embedder.load()
+    if low_memory:
+        _ACTIVE_VRAM_MODEL = "jina"
+
+
+def ensure_whisper_loaded(embedder: JinaEmbedder, device: str, low_memory: bool):
+    global _ACTIVE_VRAM_MODEL
+    if low_memory and _ACTIVE_VRAM_MODEL != "whisper":
+        if _ACTIVE_VRAM_MODEL == "jina":
+            embedder.unload()
+        elif _ACTIVE_VRAM_MODEL == "qwen":
+            unload_qwen_omni_model()
+    model, processor = load_whisper_model(device)
+    if low_memory:
+        _ACTIVE_VRAM_MODEL = "whisper"
+    return model, processor
+
+
+def ensure_qwen_loaded(embedder: JinaEmbedder, device: str, qwen_max_memory_mb: int | None, low_memory: bool):
+    global _ACTIVE_VRAM_MODEL
+    if low_memory and _ACTIVE_VRAM_MODEL != "qwen":
+        if _ACTIVE_VRAM_MODEL == "jina":
+            embedder.unload()
+        elif _ACTIVE_VRAM_MODEL == "whisper":
+            unload_whisper_model()
+    model, processor = load_qwen_omni_model(device, qwen_max_memory_mb)
+    if low_memory:
+        _ACTIVE_VRAM_MODEL = "qwen"
+    return model, processor
 
 
 def ensure_sample_rate(original_sample_rate: int, waveform: np.ndarray) -> np.ndarray:
@@ -579,7 +652,9 @@ def audio_duration_seconds(file_path: Path) -> int:
     return int(len(waveform) / YAMNET_SAMPLE_RATE)
 
 
-def classify_audio_events(media_path: Path, label_name: str) -> tuple[str, list[str]]:
+def classify_audio_events(media_path: Path, label_name: str, low_memory: bool = False) -> tuple[str, list[str]]:
+    if low_memory:
+        disable_tf_gpu()
     classifier, class_names = load_audio_classifier()
     waveform = load_audio_waveform(media_path)
     with tf.device("/CPU:0"):
@@ -604,6 +679,8 @@ def classify_audio_events(media_path: Path, label_name: str) -> tuple[str, list[
         f"Top classes: {', '.join(top_class_names)}. "
         f"Detected frame events: {', '.join(frame_class_names)}."
     )
+    if low_memory:
+        unload_audio_classifier()
     return summary, top_class_names + frame_class_names
 
 
@@ -637,8 +714,13 @@ def detect_whisper_language(tokenizer, generated_ids: torch.Tensor) -> str | Non
     return None
 
 
-def transcribe_audio(media_path: Path, device: str, language: str | None = None) -> tuple[str, str | None]:
-    whisper_model, whisper_processor = load_whisper_model(device)
+def transcribe_audio_with_model(
+    media_path: Path,
+    device: str,
+    whisper_model,
+    whisper_processor,
+    language: str | None = None,
+) -> tuple[str, str | None]:
     waveform = load_audio_waveform(media_path)
     inputs = whisper_processor(
         audio=waveform,
@@ -679,8 +761,7 @@ def transcribe_audio(media_path: Path, device: str, language: str | None = None)
     return (transcript[0].strip() if transcript else ""), detected_language
 
 
-def describe_music(media_path: Path, device: str, qwen_max_memory_mb: int | None) -> str:
-    qwen_model, qwen_processor = load_qwen_omni_model(device, qwen_max_memory_mb)
+def describe_music_with_model(media_path: Path, device: str, qwen_model, qwen_processor) -> str:
     waveform = load_audio_waveform(media_path)
     prompt = (
         "Fill out this profile about the music you hear. Be thorough.\n\n"
@@ -775,8 +856,9 @@ def encode_text_chunks(
     task: str,
     max_tokens: int,
     start_char: int = 0,
+    low_memory: bool = False,
 ) -> list[tuple[int, str, list[float]]]:
-    embedder.load()
+    ensure_jina_loaded(embedder, low_memory)
     model = embedder.model
     processor = embedder.processor
     if model is None or processor is None:
@@ -805,6 +887,7 @@ def encode_text_chunks(
                     task,
                     max_tokens // 2,
                     start_char=chunk_start,
+                    low_memory=low_memory,
                 )
             )
             continue
@@ -827,9 +910,8 @@ def build_text_records(
     modality: str = "text",
     offset_fn=None,
     low_memory: bool = False,
-    unload_after: bool = True,
 ) -> list[dict[str, object]]:
-    text_embeddings = encode_text_chunks(embedder, text, task, TOKEN_CHUNK_LIMIT)
+    text_embeddings = encode_text_chunks(embedder, text, task, TOKEN_CHUNK_LIMIT, low_memory=low_memory)
     records: list[dict[str, object]] = []
     if offset_fn is None:
         offset_fn = lambda char_offset: len(text[:char_offset].encode("utf-8"))
@@ -845,9 +927,6 @@ def build_text_records(
                 normalize_snippet_text(chunk_text_value),
             )
         )
-
-    if low_memory and unload_after:
-        embedder.unload()
     return records
 
 
@@ -873,7 +952,6 @@ def build_pdf_records(
     file_path: Path,
     task: str,
     low_memory: bool,
-    unload_after: bool = True,
 ) -> list[dict[str, object]]:
     page_texts, page_images = extract_pdf_content(file_path)
     records: list[dict[str, object]] = []
@@ -887,12 +965,11 @@ def build_pdf_records(
                 task,
                 offset_fn=lambda _char_offset, page_index=page_index: page_index,
                 low_memory=low_memory,
-                unload_after=False,
             )
             records.extend(offset_record_chunks(page_records, len(records)))
 
     for page_index, page_image in page_images:
-        embedder.load()
+        ensure_jina_loaded(embedder, low_memory)
         model = embedder.model
         if model is None:
             raise RuntimeError("embedding model failed to load")
@@ -904,8 +981,6 @@ def build_pdf_records(
 
         records.append(build_record(file_path, "image", embedding, len(records), page_index))
 
-    if low_memory and unload_after:
-        embedder.unload()
     return records
 
 
@@ -915,7 +990,6 @@ def build_pdf_records_from_source(
     pdf_path: Path,
     task: str,
     low_memory: bool,
-    unload_after: bool = True,
 ) -> list[dict[str, object]]:
     page_texts, page_images = extract_pdf_content(pdf_path)
     records: list[dict[str, object]] = []
@@ -929,12 +1003,11 @@ def build_pdf_records_from_source(
                 task,
                 offset_fn=lambda _char_offset, page_index=page_index: page_index,
                 low_memory=low_memory,
-                unload_after=False,
             )
             records.extend(offset_record_chunks(page_records, len(records)))
 
     for page_index, page_image in page_images:
-        embedder.load()
+        ensure_jina_loaded(embedder, low_memory)
         model = embedder.model
         if model is None:
             raise RuntimeError("embedding model failed to load")
@@ -954,8 +1027,6 @@ def build_pdf_records_from_source(
             )
         )
 
-    if low_memory and unload_after:
-        embedder.unload()
     return records
 
 
@@ -1064,7 +1135,6 @@ def build_cad_records(
     file_path: Path,
     task: str,
     low_memory: bool,
-    unload_after: bool = True,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     metadata_text = extract_f3d_metadata(file_path)
@@ -1077,7 +1147,6 @@ def build_cad_records(
             modality="cad_text",
             offset_fn=lambda _char_offset: 0,
             low_memory=low_memory,
-            unload_after=False,
         )
         records.extend(offset_record_chunks(metadata_records, len(records)))
 
@@ -1096,7 +1165,7 @@ def build_cad_records(
         for view_index, (view_name, direction, view_up) in enumerate(views):
             image_path = temp_dir / f"{view_index:02d}-{view_name}.png"
             render_f3d_view(file_path, image_path, direction, view_up)
-            embedder.load()
+            ensure_jina_loaded(embedder, low_memory)
             model = embedder.model
             if model is None:
                 raise RuntimeError("embedding model failed to load")
@@ -1117,10 +1186,362 @@ def build_cad_records(
                 )
             )
 
-    if low_memory and unload_after:
-        embedder.unload()
     return records
 
+
+def build_image_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+) -> list[dict[str, object]]:
+    ensure_jina_loaded(embedder, low_memory)
+    model = embedder.model
+    if model is None:
+        raise RuntimeError("embedding model failed to load")
+    with torch.inference_mode():
+        embedding = model.encode_image(images=file_path.as_posix(), task=task)
+
+    if hasattr(embedding, "detach"):
+        embedding = embedding.detach().cpu().tolist()
+
+    return [build_record(file_path, "image", embedding, 0)]
+
+
+def extract_fitz_document_content(file_path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, Image.Image]]]:
+    text_parts: list[tuple[int, str]] = []
+    page_images: list[tuple[int, Image.Image]] = []
+
+    with fitz.open(file_path) as document:
+        for page_index, page in enumerate(document):
+            page_text = page.get_text("text")
+            if page_text:
+                text_parts.append((page_index, page_text))
+
+            pixmap = page.get_pixmap(alpha=False)
+            page_image = Image.open(BytesIO(pixmap.tobytes("png"))).convert("RGB")
+            page_images.append((page_index, page_image))
+
+    return text_parts, page_images
+
+
+def build_fitz_document_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+) -> list[dict[str, object]]:
+    page_texts, page_images = extract_fitz_document_content(file_path)
+    records: list[dict[str, object]] = []
+
+    for page_index, page_text in page_texts:
+        if page_text.strip():
+            page_records = build_text_records(
+                embedder,
+                file_path,
+                page_text,
+                task,
+                offset_fn=lambda _char_offset, page_index=page_index: page_index,
+                low_memory=low_memory,
+            )
+            records.extend(offset_record_chunks(page_records, len(records)))
+
+    for page_index, page_image in page_images:
+        ensure_jina_loaded(embedder, low_memory)
+        model = embedder.model
+        if model is None:
+            raise RuntimeError("embedding model failed to load")
+        with torch.inference_mode():
+            embedding = model.encode_image(images=page_image, task=task)
+
+        if hasattr(embedding, "detach"):
+            embedding = embedding.detach().cpu().tolist()
+
+        records.append(build_record(file_path, "image", embedding, len(records), page_index))
+
+    return records
+
+
+def normalize_email_part_text(content_type: str, payload: str) -> str:
+    if content_type == "text/html":
+        return strip_html_tags(payload)
+    return normalize_plaintext(payload)
+
+
+def extract_email_body_text(message) -> str:
+    parts: list[str] = []
+    if message.is_multipart():
+        for part in message.walk():
+            disposition = (part.get_content_disposition() or "").lower()
+            if disposition == "attachment":
+                continue
+            content_type = part.get_content_type()
+            if content_type not in {"text/plain", "text/html"}:
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                continue
+            if isinstance(payload, str):
+                normalized = normalize_email_part_text(content_type, payload)
+                if normalized:
+                    parts.append(normalized)
+    else:
+        try:
+            payload = message.get_content()
+        except Exception:
+            payload = ""
+        if isinstance(payload, str):
+            normalized = normalize_email_part_text(message.get_content_type(), payload)
+            if normalized:
+                parts.append(normalized)
+    return "\n\n".join(parts)
+
+
+def build_email_header_text(message, label: str) -> str:
+    fields = []
+    for header in ("subject", "from", "to", "cc", "bcc", "date", "message-id"):
+        value = message.get(header)
+        if value:
+            fields.append(f"{header.title()}: {normalize_plaintext(str(value))}")
+    body = extract_email_body_text(message)
+    combined = [f"Email metadata for {label}."] + fields
+    if body:
+        combined.append(f"Body: {body}")
+    return "\n".join(combined)
+
+
+def iter_email_attachments(message):
+    for part in message.iter_attachments():
+        filename = part.get_filename()
+        if not filename:
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if not payload:
+            continue
+        yield filename, payload
+
+
+def build_eml_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    device: str,
+    translate: bool,
+    low_memory: bool,
+    qwen_max_memory_mb: int | None,
+    display_path: str,
+    depth: int,
+) -> list[dict[str, object]]:
+    with file_path.open("rb") as handle:
+        message = BytesParser(policy=policy.default).parse(handle)
+
+    records = build_text_records(
+        embedder,
+        file_path,
+        build_email_header_text(message, Path(display_path).name),
+        task,
+        low_memory=low_memory,
+    )
+    records = virtualize_records(records, display_path)
+
+    with tempfile.TemporaryDirectory(prefix="wolfe-eml-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        for attachment_index, (filename, payload) in enumerate(iter_email_attachments(message)):
+            attachment_path = temp_dir / f"{attachment_index:03d}-{Path(filename).name}"
+            attachment_path.write_bytes(payload)
+            attachment_display = build_virtual_path(display_path, filename)
+            attachment_records = build_records_for_file(
+                embedder,
+                attachment_path,
+                task,
+                device,
+                translate,
+                low_memory,
+                qwen_max_memory_mb,
+                display_path=attachment_display,
+                depth=depth + 1,
+            )
+            records.extend(offset_record_chunks(attachment_records, len(records)))
+
+    return records
+
+
+def build_mbox_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+    display_path: str,
+) -> list[dict[str, object]]:
+    box = mailbox.mbox(file_path.as_posix())
+    message_texts: list[str] = []
+    try:
+        for message_index, message in enumerate(box):
+            label = f"{Path(display_path).name} message {message_index + 1}"
+            message_text = build_email_header_text(message, label)
+            if message_text.strip():
+                message_texts.append(message_text)
+    finally:
+        box.close()
+
+    records: list[dict[str, object]] = []
+    for message_index, message_text in enumerate(message_texts):
+        message_records = build_text_records(
+            embedder,
+            file_path,
+            message_text,
+            task,
+            offset_fn=lambda _char_offset, message_index=message_index: message_index,
+            low_memory=low_memory,
+        )
+        records.extend(offset_record_chunks(message_records, len(records)))
+
+    return virtualize_records(records, display_path)
+
+
+def build_sqlite_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+    display_path: str,
+) -> list[dict[str, object]]:
+    connection = sqlite3.connect(f"file:{file_path.as_posix()}?mode=ro", uri=True)
+    try:
+        cursor = connection.cursor()
+        tables = cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        parts = [f"SQLite metadata for {Path(display_path).name}. Table count: {len(tables)}."]
+        for table_name, schema_sql in tables[:50]:
+            parts.append(f"Table {table_name}.")
+            if schema_sql:
+                parts.append(f"Schema: {normalize_plaintext(schema_sql)}")
+            columns = cursor.execute(f"PRAGMA table_info({sql_identifier(table_name)})").fetchall()
+            if columns:
+                column_text = ", ".join(f"{column[1]} {column[2]}" for column in columns)
+                parts.append(f"Columns: {column_text}.")
+            sample_rows = cursor.execute(f"SELECT * FROM {sql_identifier(table_name)} LIMIT 3").fetchall()
+            if sample_rows:
+                serialized_rows = []
+                for row in sample_rows:
+                    serialized_rows.append(normalize_plaintext(json.dumps(row, default=str)))
+                parts.append(f"Sample rows: {'; '.join(serialized_rows)}.")
+        text = "\n".join(parts)
+    finally:
+        connection.close()
+
+    records = build_text_records(
+        embedder,
+        file_path,
+        text,
+        task,
+        low_memory=low_memory,
+    )
+    return virtualize_records(records, display_path)
+
+
+def stringify_notebook_output(output: dict[str, object]) -> str:
+    text_chunks: list[str] = []
+    for key in ("text", "text/plain", "application/json"):
+        value = output.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            text_chunks.append("".join(str(item) for item in value))
+        else:
+            text_chunks.append(str(value))
+    data = output.get("data")
+    if isinstance(data, dict):
+        for key in ("text/plain", "application/json", "text/html"):
+            value = data.get(key)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                text_chunks.append("".join(str(item) for item in value))
+            else:
+                text_chunks.append(str(value))
+    return normalize_plaintext("\n".join(text_chunks))
+
+
+def build_notebook_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+    display_path: str,
+) -> list[dict[str, object]]:
+    notebook = json.loads(file_path.read_text(encoding="utf-8"))
+    parts = [f"Notebook content for {Path(display_path).name}."]
+    for cell_index, cell in enumerate(notebook.get("cells", [])):
+        cell_type = cell.get("cell_type", "unknown")
+        source = cell.get("source", [])
+        source_text = "".join(source) if isinstance(source, list) else str(source)
+        normalized_source = normalize_plaintext(source_text)
+        if normalized_source:
+            parts.append(f"{cell_type.title()} cell {cell_index + 1}: {normalized_source}")
+        outputs = cell.get("outputs", [])
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            output_text = stringify_notebook_output(output)
+            if output_text:
+                parts.append(f"Output for cell {cell_index + 1}: {output_text}")
+
+    records = build_text_records(
+        embedder,
+        file_path,
+        "\n".join(parts),
+        task,
+        low_memory=low_memory,
+    )
+    return virtualize_records(records, display_path)
+
+
+def extract_archive_to_dir(file_path: Path, output_dir: Path) -> None:
+    name = file_path.name.lower()
+    if zipfile.is_zipfile(file_path):
+        with zipfile.ZipFile(file_path) as archive:
+            archive.extractall(output_dir)
+        return
+    if tarfile.is_tarfile(file_path):
+        with tarfile.open(file_path) as archive:
+            archive.extractall(output_dir)
+        return
+    if name.endswith(".7z"):
+        seven_zip = require_binary("7z", "archive ingestion")
+        run_process([seven_zip, "x", f"-o{output_dir.as_posix()}", file_path.as_posix()], f"7z extraction failed for {file_path.name}")
+        return
+    if name.endswith(".cbr"):
+        if shutil.which("unrar"):
+            run_process(
+                [require_binary("unrar", "archive ingestion"), "x", "-idq", file_path.as_posix(), output_dir.as_posix()],
+                f"unrar extraction failed for {file_path.name}",
+            )
+            return
+        seven_zip = require_binary("7z", "archive ingestion")
+        run_process([seven_zip, "x", f"-o{output_dir.as_posix()}", file_path.as_posix()], f"7z extraction failed for {file_path.name}")
+        return
+    raise RuntimeError(f"unsupported archive format for {file_path.name}")
+
+
+def iter_extracted_files(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*") if path.is_file())
+
+
+def build_archive_summary_text(file_path: Path, extracted_files: list[Path], archive_display_path: str, extraction_root: Path) -> str:
+    relative_names = [path.relative_to(extraction_root).as_posix() for path in extracted_files[:200]]
+    parts = [
+        f"Archive contents for {Path(archive_display_path).name}.",
+        f"Contained file count: {len(extracted_files)}.",
+    ]
+    if relative_names:
+        parts.append(f"Contained files: {', '.join(relative_names)}.")
+    return " ".join(parts)
 
 def convert_document_to_pdf(path: Path) -> tuple[Path | None, tempfile.TemporaryDirectory | None, str | None]:
     soffice_path = shutil.which("soffice")
@@ -1171,12 +1592,11 @@ def build_audio_records(
     translate: bool,
     low_memory: bool,
     qwen_max_memory_mb: int | None,
-    unload_after: bool = True,
     label_name: str | None = None,
 ) -> list[dict[str, object]]:
     media_label = label_name or metadata_path.name
     duration_seconds = audio_duration_seconds(media_path)
-    audio_text, class_names = classify_audio_events(media_path, media_label)
+    audio_text, class_names = classify_audio_events(media_path, media_label, low_memory=low_memory)
     records = build_text_records(
         embedder,
         metadata_path,
@@ -1185,22 +1605,38 @@ def build_audio_records(
         modality="audio",
         offset_fn=lambda _char_offset: 0,
         low_memory=low_memory,
-        unload_after=False,
     )
 
     if should_transcribe_audio(class_names):
-        if low_memory:
-            embedder.unload()
-        transcript, detected_language = transcribe_audio(media_path, device)
+        whisper_model, whisper_processor = ensure_whisper_loaded(embedder, device, low_memory)
+        transcript, detected_language = transcribe_audio_with_model(
+            media_path,
+            device,
+            whisper_model,
+            whisper_processor,
+        )
         transcripts: list[tuple[str, str]] = []
         if transcript:
             label = detected_language or "unknown"
             transcripts.append((f"Audio transcription ({label}) for {media_label}. {transcript}", label))
 
         if translate and detected_language and detected_language != "en":
-            translated, _ = transcribe_audio(media_path, device, language="en")
+            translated, _ = transcribe_audio_with_model(
+                media_path,
+                device,
+                whisper_model,
+                whisper_processor,
+                language="en",
+            )
             if translated:
                 transcripts.append((f"Audio transcription (en) for {media_label}. {translated}", "en"))
+
+        if low_memory:
+            unload_whisper_model()
+            del whisper_model, whisper_processor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         for transcript_text, _lang in transcripts:
             transcript_records = build_text_records(
@@ -1211,32 +1647,26 @@ def build_audio_records(
                 modality="audio",
                 offset_fn=lambda _char_offset: 0,
                 low_memory=low_memory,
-                unload_after=False,
             )
             transcript_records = offset_record_chunks(transcript_records, len(records))
             transcript_offsets = linear_offsets(len(transcript_records), duration_seconds)
             for record, offset in zip(transcript_records, transcript_offsets):
                 record["offset"] = offset
             records.extend(transcript_records)
-        if low_memory and unload_after:
-            embedder.unload()
-        if low_memory:
-            unload_whisper_model()
 
     if should_characterize_music(class_names):
         description = ""
-        if low_memory:
-            embedder.unload()
-            unload_whisper_model()
-            unload_audio_classifier()
         try:
-            description = describe_music(media_path, device, qwen_max_memory_mb)
+            qwen_model, qwen_processor = ensure_qwen_loaded(embedder, device, qwen_max_memory_mb, low_memory)
+            description = describe_music_with_model(media_path, device, qwen_model, qwen_processor)
         except Exception as exc:
             print(f"music characterization failed for {media_label}: {exc}", file=sys.stderr)
-        finally:
-            if low_memory:
-                unload_qwen_omni_model()
-                embedder.load()
+        if low_memory:
+            unload_qwen_omni_model()
+            del qwen_model, qwen_processor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         if description:
             description_records = build_text_records(
                 embedder,
@@ -1246,7 +1676,6 @@ def build_audio_records(
                 modality="audio",
                 offset_fn=lambda _char_offset: 0,
                 low_memory=low_memory,
-                unload_after=False,
             )
             description_records = offset_record_chunks(description_records, len(records))
             description_offsets = linear_offsets(len(description_records), duration_seconds)
@@ -1258,12 +1687,6 @@ def build_audio_records(
         record_offsets = linear_offsets(len(records), duration_seconds)
         for record, offset in zip(records, record_offsets):
             record["offset"] = offset
-
-    if low_memory and not unload_after and embedder.model is None:
-        embedder.load()
-
-    if low_memory and unload_after:
-        embedder.unload()
 
     return records
 
@@ -1485,7 +1908,6 @@ def build_video_records(
     translate: bool,
     low_memory: bool,
     qwen_max_memory_mb: int | None,
-    unload_after: bool = True,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     video_stream = get_video_stream_metadata(file_path)
@@ -1506,7 +1928,6 @@ def build_video_records(
                 modality="video_text",
                 offset_fn=lambda _char_offset, cue_offset=cue_offset: cue_offset,
                 low_memory=low_memory,
-                unload_after=False,
             )
             records.extend(offset_record_chunks(caption_records, len(records)))
 
@@ -1521,7 +1942,6 @@ def build_video_records(
                 translate,
                 low_memory,
                 qwen_max_memory_mb,
-                unload_after=False,
                 label_name=file_path.name,
             )
             if audio_records:
@@ -1535,7 +1955,7 @@ def build_video_records(
         keyframe_offsets = extract_video_keyframe_offsets(file_path, fps)
         keyframe_paths = extract_video_keyframes(file_path, temp_dir)
         for keyframe_index, keyframe_path in enumerate(keyframe_paths):
-            embedder.load()
+            ensure_jina_loaded(embedder, low_memory)
             model = embedder.model
             if model is None:
                 raise RuntimeError("embedding model failed to load")
@@ -1548,8 +1968,207 @@ def build_video_records(
             frame_offset = keyframe_offsets[keyframe_index] if keyframe_index < len(keyframe_offsets) else keyframe_index
             records.append(build_record(file_path, "image", embedding, len(records), frame_offset))
 
-        if low_memory and unload_after:
-            embedder.unload()
+    return records
+
+
+def build_archive_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    device: str,
+    translate: bool,
+    low_memory: bool,
+    qwen_max_memory_mb: int | None,
+    display_path: str,
+    depth: int,
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    with tempfile.TemporaryDirectory(prefix="wolfe-archive-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        extract_archive_to_dir(file_path, temp_dir)
+        extracted_files = iter_extracted_files(temp_dir)
+
+        summary_records = build_text_records(
+            embedder,
+            file_path,
+            build_archive_summary_text(file_path, extracted_files, display_path, temp_dir),
+            task,
+            modality="archive_text",
+            offset_fn=lambda _char_offset: 0,
+            low_memory=low_memory,
+        )
+        summary_records = virtualize_records(summary_records, display_path)
+        records.extend(offset_record_chunks(summary_records, len(records)))
+
+        for extracted_file in extracted_files:
+            relative_path = extracted_file.relative_to(temp_dir).as_posix()
+            child_display = build_virtual_path(display_path, relative_path)
+            child_records = build_records_for_file(
+                embedder,
+                extracted_file,
+                task,
+                device,
+                translate,
+                low_memory,
+                qwen_max_memory_mb,
+                display_path=child_display,
+                depth=depth + 1,
+            )
+            records.extend(offset_record_chunks(child_records, len(records)))
+    return records
+
+
+def build_records_for_file(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    device: str,
+    translate: bool,
+    low_memory: bool,
+    qwen_max_memory_mb: int | None,
+    display_path: str | None = None,
+    depth: int = 0,
+) -> list[dict[str, object]]:
+    if depth > 4:
+        raise RuntimeError(f"nested container depth exceeded for {file_path.name}")
+
+    resolved_display_path = display_path or file_path.resolve().as_posix()
+    records: list[dict[str, object]]
+    already_virtualized = False
+
+    if is_video_file(file_path) and has_video_stream(file_path):
+        records = build_video_records(
+            embedder,
+            file_path,
+            task,
+            device,
+            translate,
+            low_memory,
+            qwen_max_memory_mb,
+        )
+    elif is_pdf_file(file_path):
+        records = build_pdf_records(
+            embedder,
+            file_path,
+            task,
+            low_memory,
+        )
+    elif is_fitz_document_file(file_path):
+        records = build_fitz_document_records(
+            embedder,
+            file_path,
+            task,
+            low_memory,
+        )
+    elif is_document_file(file_path):
+        pdf_path = None
+        tmpdir = None
+        reason = None
+        try:
+            pdf_path, tmpdir, reason = convert_document_to_pdf(file_path)
+            if pdf_path:
+                records = build_pdf_records_from_source(
+                    embedder,
+                    file_path,
+                    pdf_path,
+                    task,
+                    low_memory,
+                )
+            else:
+                raise RuntimeError(reason or "libreoffice_conversion_failed")
+        finally:
+            if tmpdir is not None:
+                tmpdir.cleanup()
+    elif is_archive_file(file_path):
+        records = build_archive_records(
+            embedder,
+            file_path,
+            task,
+            device,
+            translate,
+            low_memory,
+            qwen_max_memory_mb,
+            resolved_display_path,
+            depth,
+        )
+        already_virtualized = True
+    elif file_path.suffix.lower() == ".eml":
+        records = build_eml_records(
+            embedder,
+            file_path,
+            task,
+            device,
+            translate,
+            low_memory,
+            qwen_max_memory_mb,
+            resolved_display_path,
+            depth,
+        )
+        already_virtualized = True
+    elif file_path.suffix.lower() == ".mbox":
+        records = build_mbox_records(
+            embedder,
+            file_path,
+            task,
+            low_memory,
+            resolved_display_path,
+        )
+    elif is_sqlite_file(file_path):
+        records = build_sqlite_records(
+            embedder,
+            file_path,
+            task,
+            low_memory,
+            resolved_display_path,
+        )
+    elif is_notebook_file(file_path):
+        records = build_notebook_records(
+            embedder,
+            file_path,
+            task,
+            low_memory,
+            resolved_display_path,
+        )
+    elif is_audio_file(file_path):
+        records = build_audio_records(
+            embedder,
+            file_path,
+            file_path,
+            task,
+            device,
+            translate,
+            low_memory,
+            qwen_max_memory_mb,
+        )
+    elif is_cad_file(file_path):
+        records = build_cad_records(
+            embedder,
+            file_path,
+            task,
+            low_memory,
+        )
+    elif is_image_file(file_path):
+        records = build_image_records(
+            embedder,
+            file_path,
+            task,
+            low_memory,
+        )
+    else:
+        text = read_text_file(file_path)
+        if text is None:
+            raise RuntimeError("unsupported_file_type")
+        records = build_text_records(
+            embedder,
+            file_path,
+            text,
+            task,
+            low_memory=low_memory,
+        )
+
+    if not already_virtualized and resolved_display_path != file_path.resolve().as_posix():
+        records = virtualize_records(records, resolved_display_path)
+
     return records
 
 
@@ -1596,7 +2215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--low-memory",
         action="store_true",
-        help="Unload and reload models so only one of Jina or Qwen Omni is in VRAM at a time",
+        help="Keep only one large PyTorch model in VRAM at a time and force YAMNet onto CPU",
     )
     parser.add_argument(
         "--qwen-max-memory",
@@ -1605,24 +2224,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--document-extensions",
-        help="Comma-separated list of document extensions used for LibreOffice conversion",
+        help="Comma-separated LibreOffice document extensions passed by the Rust CLI for file ingest",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.query_text is None and not args.document_extensions:
+        raise RuntimeError("--document-extensions is required for file ingest")
     if args.document_extensions:
         extensions = {ext.strip().lower() for ext in args.document_extensions.split(",") if ext.strip()}
         if extensions:
             global DOCUMENT_EXTENSIONS
             DOCUMENT_EXTENSIONS = extensions
+    if args.low_memory:
+        disable_tf_gpu()
     device = detect_device(args.device)
     embedder = JinaEmbedder(args.model_dir, device)
-    embedder.load()
 
     if args.query_text is not None:
-        embedder.load()
+        ensure_jina_loaded(embedder, args.low_memory)
         model = embedder.model
         if model is None:
             raise RuntimeError("embedding model failed to load")
@@ -1655,136 +2277,27 @@ def main() -> None:
         file_path = Path(request["path"])
 
         try:
-            if is_video_file(file_path) and has_video_stream(file_path):
-                for record in build_video_records(
-                    embedder,
-                    file_path,
-                    args.task,
-                    device,
-                    args.translate,
-                    args.low_memory,
-                    args.qwen_max_memory,
-                    unload_after=False,
-                ):
-                    emit_json(record)
-                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                continue
-
-            if is_pdf_file(file_path):
-                for record in build_pdf_records(
-                    embedder,
-                    file_path,
-                    args.task,
-                    args.low_memory,
-                    unload_after=False,
-                ):
-                    emit_json(record)
-                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                continue
-
-            if is_document_file(file_path):
-                pdf_path = None
-                tmpdir = None
-                reason = None
-                try:
-                    pdf_path, tmpdir, reason = convert_document_to_pdf(file_path)
-                    if pdf_path:
-                        for record in build_pdf_records_from_source(
-                            embedder,
-                            file_path,
-                            pdf_path,
-                            args.task,
-                            args.low_memory,
-                            unload_after=False,
-                        ):
-                            emit_json(record)
-                        emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                        continue
-                finally:
-                    if tmpdir is not None:
-                        tmpdir.cleanup()
-
-                emit_json(
-                    {
-                        "status": "skipped",
-                        "path": file_path.resolve().as_posix(),
-                        "reason": reason or "libreoffice_conversion_failed",
-                    }
-                )
-                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                continue
-
-            if is_audio_file(file_path):
-                for record in build_audio_records(
-                    embedder,
-                    file_path,
-                    file_path,
-                    args.task,
-                    device,
-                    args.translate,
-                    args.low_memory,
-                    args.qwen_max_memory,
-                    unload_after=False,
-                ):
-                    emit_json(record)
-                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                continue
-
-            if is_cad_file(file_path):
-                for record in build_cad_records(
-                    embedder,
-                    file_path,
-                    args.task,
-                    args.low_memory,
-                    unload_after=False,
-                ):
-                    emit_json(record)
-                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                continue
-
-            if is_image_file(file_path):
-                embedder.load()
-                model = embedder.model
-                if model is None:
-                    raise RuntimeError("embedding model failed to load")
-                with torch.inference_mode():
-                    embedding = model.encode_image(images=file_path.as_posix(), task=args.task)
-
-                if hasattr(embedding, "detach"):
-                    embedding = embedding.detach().cpu().tolist()
-
-                emit_json(build_record(file_path, "image", embedding, 0))
-                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                continue
-
-            text = read_text_file(file_path)
-            if text is None:
-                emit_json(
-                    {
-                        "status": "skipped",
-                        "path": file_path.resolve().as_posix(),
-                        "reason": "unsupported_file_type",
-                    }
-                )
-                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
-                continue
-
-            for record in build_text_records(
+            for record in build_records_for_file(
                 embedder,
                 file_path,
-                text,
                 args.task,
-                low_memory=args.low_memory,
-                unload_after=False,
+                device,
+                args.translate,
+                args.low_memory,
+                args.qwen_max_memory,
             ):
                 emit_json(record)
             emit_json({"status": "done", "path": file_path.resolve().as_posix()})
         except Exception as exc:
+            status = "error"
+            reason = str(exc)
+            if reason == "unsupported_file_type":
+                status = "skipped"
             emit_json(
                 {
-                    "status": "error",
+                    "status": status,
                     "path": file_path.resolve().as_posix(),
-                    "reason": str(exc),
+                    "reason": reason,
                 }
             )
             emit_json({"status": "done", "path": file_path.resolve().as_posix()})

@@ -4,19 +4,22 @@ Multimodal semantic file search for intelligently investigating your files
 Local only, 100% offline, your data stays on your computer.
 
 # How it works
-Wolfe uses LibreOffice, ffmpeg, mupdf, and F3D to decompose almost any file into streams of audio, text, and images. Audio streams are processed through YAMNet to identify audio events and type. When speech is detected, an additional processing step through Whisper Large v3 is used to transcribe and optionally translate it to text. When music is detected, an additional processing step through Qwen 2.5 Omni 7B is used to characterize and describe the music in text. CAD / 3D files supported by F3D are inspected for textual metadata and rendered into a fixed set of centered orthographic screenshots from the cardinal directions. The resulting streams of images and text are passed through Jina Embedding v4 to generate the embeddings stored in the database with file metadata.
+Wolfe uses LibreOffice, ffmpeg, mupdf, F3D, and a small set of structured-text/container extractors to decompose almost any file into streams of audio, text, and images. Audio streams are processed through YAMNet to identify audio events and type. When speech is detected, an additional processing step through Whisper Large v3 is used to transcribe and optionally translate it to text. When music is detected, an additional processing step through Qwen 2.5 Omni 7B is used to characterize and describe the music in text. CAD / 3D files supported by F3D are inspected for textual metadata and rendered into a fixed set of centered orthographic screenshots from the cardinal directions plus an isometric view. Archives are unpacked and recursively ingested through the same pipeline, email files extract message text and attachments, SQLite databases extract schema and sample rows, and notebooks extract markdown, code, and textual outputs. The resulting streams of images and text are passed through Jina Embedding v4 to generate the embeddings stored in the database with file metadata.
 
 Search text is passed through Jina Embedding v4 to produce an embedding.  When queried with the search embedding, the database returns the closest matches and their associated metadata.
 
 ### Supported File Types
 
-- Text: UTF-8 text files
-- PDF: `.pdf`
-- Document: `.csv` `.dbf` `.dif` `.doc` `.docm` `.docx` `.dot` `.dotm` `.dotx` `.fodg` `.fodp` `.fods` `.fodt` `.htm` `.html` `.mht` `.mhtml` `.odb` `.odc` `.odf` `.odg` `.odm` `.odp` `.ods` `.odt` `.oth` `.otp` `.ots` `.ott` `.otg` `.otm` `.pot` `.potm` `.potx` `.pps` `.ppsm` `.ppsx` `.ppt` `.pptm` `.pptx` `.rtf` `.sda` `.sdc` `.sdd` `.sdw` `.slk` `.sxc` `.sxd` `.sxg` `.sxi` `.sxm` `.sxw` `.tab` `.tsv` `.txt` `.uot` `.uop` `.uos` `.uof` `.vdx` `.vsd` `.vsdx` `.xhtml` `.xls` `.xlsm` `.xlsx` `.xlt` `.xltm` `.xltx` `.xml`
-- CAD / 3D: `.3ds` `.gltf` `.glb` `.obj` `.ply` `.stl` `.vtm` `.vti` `.vtk` `.vtp` `.vtr` `.vts` `.vtu` `.wrl` `.x3d`
-- Images: `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`
-- Audio: `.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`, `.webm`
-- Video: `.avi`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.ts`, `.webm`
+- Text: UTF-8 text files, including common plaintext formats such as `.cfg` `.ics` `.ini` `.jsonl` `.log` `.md` `.rst` `.srt` `.toml` `.vtt` `.yaml` `.yml` and other unknown-but-UTF-8 plaintext files
+- MuPDF-backed paged documents: `.pdf` `.djvu` `.epub` `.ps`
+- LibreOffice-converted documents: `.csv` `.dbf` `.dif` `.doc` `.docm` `.docx` `.dot` `.dotm` `.dotx` `.fodg` `.fodp` `.fods` `.fodt` `.htm` `.html` `.mht` `.mhtml` `.odb` `.odc` `.odf` `.odg` `.odm` `.odp` `.ods` `.odt` `.oth` `.otp` `.ots` `.ott` `.otg` `.otm` `.pot` `.potm` `.potx` `.pps` `.ppsm` `.ppsx` `.ppt` `.pptm` `.pptx` `.rtf` `.sda` `.sdc` `.sdd` `.sdw` `.slk` `.svg` `.sxc` `.sxd` `.sxg` `.sxi` `.sxm` `.sxw` `.tab` `.tsv` `.txt` `.uot` `.uop` `.uos` `.uof` `.vdx` `.vsd` `.vsdx` `.xhtml` `.xls` `.xlsm` `.xlsx` `.xlt` `.xltm` `.xltx` `.xml`
+- CAD / 3D through F3D: `.3ds` `.gltf` `.glb` `.obj` `.ply` `.stl` `.vtm` `.vti` `.vtk` `.vtp` `.vtr` `.vts` `.vtu` `.wrl` `.x3d`
+- Images: `.avif` `.bmp` `.gif` `.heic` `.heif` `.jpeg` `.jpg` `.png` `.psd` `.tif` `.tiff` `.webp`
+- Audio: `.aac` `.aif` `.aiff` `.au` `.flac` `.m4a` `.mp3` `.ogg` `.opus` `.wav` `.webm`
+- Video: `.3gp` `.avi` `.m2ts` `.m4v` `.mkv` `.mov` `.mp4` `.mpeg` `.mpg` `.ts` `.webm`
+- Email / mailbox: `.eml` `.mbox`
+- Notebook / database: `.ipynb` `.db3` `.sqlite` `.sqlite3`
+- Archives and comic containers: `.zip` `.tar` `.tgz` `.tbz2` `.txz` `.7z` `.cbz` `.cbr`
 
 ### Ingestion Diagram
 
@@ -39,6 +42,13 @@ flowchart TD
     P4 --> P5[Embed Page Images]
     P5 --> P6[Store Image Records]
 
+    B -->|MuPDF Docs| M[Extract Text via MuPDF]
+    M --> M1[Render Pages to Images]
+    M --> M2[Embed Text Chunks]
+    M2 --> M3[Store Text Records]
+    M1 --> M4[Embed Page Images]
+    M4 --> M5[Store Image Records]
+
     B -->|CAD| C[Load CAD through F3D]
     C --> C1[Extract F3D Text Metadata]
     C1 --> C2[Embed Metadata Text]
@@ -46,6 +56,26 @@ flowchart TD
     C --> C4[Render Cardinal + Isometric Views]
     C4 --> C5[Embed View Images]
     C5 --> C6[Store CAD Image Records]
+
+    B -->|Archive| AR[Extract Archive]
+    AR --> AR1[Build Archive Summary Text]
+    AR1 --> AR2[Embed Summary Text]
+    AR2 --> AR3[Store Archive Summary Records]
+    AR --> AR4[Recurse into Extracted Files]
+
+    B -->|Email| E[Extract Headers and Body]
+    E --> E1[Embed Email Text]
+    E1 --> E2[Store Email Text Records]
+    E --> E3[Extract Attachments]
+    E3 --> E4[Recurse into Attachment Files]
+
+    B -->|SQLite| S[Extract Schema and Sample Rows]
+    S --> S1[Embed Database Text]
+    S1 --> S2[Store Database Text Records]
+
+    B -->|Notebook| N[Extract Markdown Code and Outputs]
+    N --> N1[Embed Notebook Text]
+    N1 --> N2[Store Notebook Text Records]
 
     B -->|Image| I[Load Image]
     I --> I1[Embed Image]
@@ -133,11 +163,19 @@ CAD / 3D ingest with watch mode:
 cargo run -- --path /path/to/cad-or-3d-directory --watch --db wolfe.lance
 ```
 
+Archive ingest example:
+
+```bash
+cargo run -- --path /path/to/archive-or-directory --db wolfe.lance
+```
+
 Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`.
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
 CAD ingestion requires `f3d` to be available on `PATH` with an offscreen rendering backend capable of writing `--output` images. Wolfe extracts text metadata from `f3d --no-render --verbose=debug` output and renders centered orthographic views from the front, back, left, right, top, bottom, and isometric directions. The isometric render uses a corner-facing camera aimed toward the model center. If F3D is installed but cannot render offscreen on your machine, CAD files will fail ingest with an F3D backend error.
+
+Archive ingestion for `.zip`, `.tar`, `.tgz`, `.tbz2`, `.txz`, and `.cbz` uses Python’s built-in archive support. `.7z` requires `7z` on `PATH`, and `.cbr` uses `unrar` when available or falls back to `7z`.
 
 Music characterization runs when YAMNet flags audio as music. Wolfe sends the audio to Qwen Omni and stores the response as additional audio-derived text chunks for search. The prompt used is:
 
@@ -171,11 +209,20 @@ Similar works: ""
 - `--range START:END`: Return a subset of search results (0-based, end-exclusive).
 - `--json`: Emit search results as a JSON array instead of tab-separated text.
 - `--translate`: For non-English audio, run a second Whisper pass forced to English.
-- `--low-memory`: Unload/reload Jina, Qwen Omni, and Whisper so only one large model is in VRAM at a time during ingest.
+- `--low-memory`: Keep only one large PyTorch model in VRAM at a time during ingest and force YAMNet onto CPU.
 - `--qwen-max-memory MB`: Cap Qwen's GPU usage (MB) when `device_map=auto` is used; lower values offload more to CPU.
 - `--ignore PATH`: File or directory name/path to ignore (repeatable).
 - `--ignore-file FILE`: File containing newline-separated ignore entries.
 - `--watch`: Watch for changes and keep the index up to date (requires `--path`).
+
+Format notes for the CLI:
+
+- There are no extra flags for archives, email, notebooks, or SQLite files; they are detected by extension and routed through the worker automatically.
+- `--path` can point at a single archive, mailbox, notebook, database, or a directory containing any mix of supported formats.
+- `--watch` re-runs ingest when supported source files change on disk. For archives, that means the archive file itself changing, not files previously extracted into a temp directory.
+- `--ignore` and `--ignore-file` apply before recursive archive expansion, so ignored archives are skipped entirely.
+- `--device` affects PyTorch model execution. `--low-memory` also changes the audio path by forcing YAMNet onto CPU; neither flag changes MuPDF extraction, SQLite reads, archive unpacking, or F3D rendering behavior.
+- Archive members and email attachments are stored under virtual source paths in the index using a `container!/member/path` style path so search results still point back to the containing file.
 
 ## Setup
 
@@ -192,6 +239,8 @@ python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy
 ```
 
 Install F3D separately and ensure `f3d` is on `PATH` for CAD / 3D ingest.
+
+Install `7z` if you want `.7z` or `.cbr` archive support. Install `unrar` if you want native `.cbr` extraction without the `7z` fallback.
 
 Install a PyTorch build that matches your hardware:
 
