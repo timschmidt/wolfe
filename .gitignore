@@ -3,3 +3,4 @@
 /.venv
 /scripts/__pycache__/
 /wolfe.lance
+.codex

@@ -136,6 +136,23 @@ VIDEO_EXTENSIONS = {
     ".ts",
     ".webm",
 }
+CAD_EXTENSIONS = {
+    ".3ds",
+    ".gltf",
+    ".glb",
+    ".obj",
+    ".ply",
+    ".stl",
+    ".vtm",
+    ".vti",
+    ".vtk",
+    ".vtp",
+    ".vtr",
+    ".vts",
+    ".vtu",
+    ".wrl",
+    ".x3d",
+}
 TOKEN_CHUNK_LIMIT = 20000
 MIN_TOKEN_CHUNK_LIMIT = 1000
 YAMNET_SAMPLE_RATE = 16000
@@ -213,6 +230,10 @@ def is_audio_file(path: Path) -> bool:
 
 def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def is_cad_file(path: Path) -> bool:
+    return path.suffix.lower() in CAD_EXTENSIONS
 
 
 DOCUMENT_EXTENSIONS: set[str] = set(DEFAULT_DOCUMENT_EXTENSIONS)
@@ -301,6 +322,13 @@ def require_ffmpeg_binary(name: str) -> str:
     return binary
 
 
+def require_binary(name: str, feature_name: str) -> str:
+    binary = shutil.which(name)
+    if binary is None:
+        raise RuntimeError(f"{name} is required for {feature_name} but was not found in PATH")
+    return binary
+
+
 def run_process(command: list[str], failure_message: str) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -311,8 +339,10 @@ def run_process(command: list[str], failure_message: str) -> subprocess.Complete
         )
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip()
-        if stderr:
-            raise RuntimeError(f"{failure_message}: {stderr}") from exc
+        stdout = exc.stdout.strip()
+        details = stderr or stdout
+        if details:
+            raise RuntimeError(f"{failure_message}: {details}") from exc
         raise RuntimeError(failure_message) from exc
 
 
@@ -929,6 +959,168 @@ def build_pdf_records_from_source(
     return records
 
 
+def strip_ansi_escape_codes(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def parse_f3d_metadata_output(output: str, file_path: Path) -> str:
+    cleaned_lines = [line.strip() for line in strip_ansi_escape_codes(output).splitlines()]
+    metadata_lines: list[str] = []
+
+    for line in cleaned_lines:
+        if not line:
+            continue
+        if line.startswith("Found a reader for"):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("Number of files:"):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("Number of actors:"):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("Scene bounding box:"):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("Camera position:"):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("Camera focal point:"):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("Camera view up:"):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("data output "):
+            metadata_lines.append(line)
+            continue
+        if line.startswith("Version:") or line.startswith("Description:"):
+            metadata_lines.append(line)
+
+    prefix = f"CAD metadata for {file_path.name}. Format: {file_path.suffix.lower()}."
+    if metadata_lines:
+        return f"{prefix} {' '.join(metadata_lines)}"
+    return prefix
+
+
+def extract_f3d_metadata(file_path: Path) -> str:
+    f3d_bin = require_binary("f3d", "CAD ingestion")
+    result = run_process(
+        [
+            f3d_bin,
+            "--no-config",
+            "--no-render",
+            "--verbose=debug",
+            file_path.as_posix(),
+        ],
+        f"f3d metadata extraction failed for {file_path.name}",
+    )
+    combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    return parse_f3d_metadata_output(combined_output, file_path)
+
+
+def render_f3d_view(file_path: Path, output_path: Path, direction: str, view_up: str) -> None:
+    f3d_bin = require_binary("f3d", "CAD ingestion")
+    try:
+        run_process(
+            [
+                f3d_bin,
+                "--no-config",
+                "--output",
+                output_path.as_posix(),
+                "--resolution",
+                "1024,1024",
+                "--camera-direction",
+                direction,
+                "--camera-view-up",
+                view_up,
+                "--camera-orthographic",
+                "--axis=0",
+                "--grid=0",
+                "--filename=0",
+                "--metadata=0",
+                "--loading-progress=0",
+                "--animation-progress=0",
+                "--background-color",
+                "#ffffff",
+                "--edges=1",
+                file_path.as_posix(),
+            ],
+            f"f3d render failed for {file_path.name}",
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"f3d render failed for {file_path.name}: {exc}. Ensure F3D has a usable rendering backend for offscreen output."
+        ) from exc
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"f3d render did not produce an image for {file_path.name}. Ensure F3D can render offscreen on this machine."
+        )
+
+
+def build_cad_records(
+    embedder: JinaEmbedder,
+    file_path: Path,
+    task: str,
+    low_memory: bool,
+    unload_after: bool = True,
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    metadata_text = extract_f3d_metadata(file_path)
+    if metadata_text.strip():
+        metadata_records = build_text_records(
+            embedder,
+            file_path,
+            metadata_text,
+            task,
+            modality="cad_text",
+            offset_fn=lambda _char_offset: 0,
+            low_memory=low_memory,
+            unload_after=False,
+        )
+        records.extend(offset_record_chunks(metadata_records, len(records)))
+
+    views = (
+        ("front", "-Z", "+Y"),
+        ("back", "+Z", "+Y"),
+        ("left", "+X", "+Y"),
+        ("right", "-X", "+Y"),
+        ("top", "-Y", "+Z"),
+        ("bottom", "+Y", "-Z"),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="wolfe-cad-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        for view_index, (view_name, direction, view_up) in enumerate(views):
+            image_path = temp_dir / f"{view_index:02d}-{view_name}.png"
+            render_f3d_view(file_path, image_path, direction, view_up)
+            embedder.load()
+            model = embedder.model
+            if model is None:
+                raise RuntimeError("embedding model failed to load")
+            with torch.inference_mode():
+                embedding = model.encode_image(images=image_path.as_posix(), task=task)
+
+            if hasattr(embedding, "detach"):
+                embedding = embedding.detach().cpu().tolist()
+
+            records.append(
+                build_record(
+                    file_path,
+                    "image",
+                    embedding,
+                    len(records),
+                    view_index,
+                    plaintext=f"cad view: {view_name}",
+                )
+            )
+
+    if low_memory and unload_after:
+        embedder.unload()
+    return records
+
+
 def convert_document_to_pdf(path: Path) -> tuple[Path | None, tempfile.TemporaryDirectory | None, str | None]:
     soffice_path = shutil.which("soffice")
     if not soffice_path:
@@ -1531,6 +1723,18 @@ def main() -> None:
                     args.translate,
                     args.low_memory,
                     args.qwen_max_memory,
+                    unload_after=False,
+                ):
+                    emit_json(record)
+                emit_json({"status": "done", "path": file_path.resolve().as_posix()})
+                continue
+
+            if is_cad_file(file_path):
+                for record in build_cad_records(
+                    embedder,
+                    file_path,
+                    args.task,
+                    args.low_memory,
                     unload_after=False,
                 ):
                     emit_json(record)

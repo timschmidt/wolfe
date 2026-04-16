@@ -4,7 +4,7 @@ Multimodal semantic file search for intelligently investigating your files
 Local only, 100% offline, your data stays on your computer.
 
 # How it works
-Wolfe uses LibreOffice, ffmpeg, and mupdf to decompose almost any file into streams of audio, text, and images.  Audio streams are processed through YAMNet to identify audio events and type.  When speech is detected, an additional processing step through Whisper Large v3 is used to transcribe and optionally translate it to text.  When music is detected, an additional processing step through Qwen 2.5 Omni 7B is used to characterize and describe the music in text.  The resulting streams of images and text are passed through Jina Embedding v4 to generate the embeddings stored in the database with file metadata.
+Wolfe uses LibreOffice, ffmpeg, mupdf, and F3D to decompose almost any file into streams of audio, text, and images. Audio streams are processed through YAMNet to identify audio events and type. When speech is detected, an additional processing step through Whisper Large v3 is used to transcribe and optionally translate it to text. When music is detected, an additional processing step through Qwen 2.5 Omni 7B is used to characterize and describe the music in text. CAD / 3D files supported by F3D are inspected for textual metadata and rendered into a fixed set of centered orthographic screenshots from the cardinal directions. The resulting streams of images and text are passed through Jina Embedding v4 to generate the embeddings stored in the database with file metadata.
 
 Search text is passed through Jina Embedding v4 to produce an embedding.  When queried with the search embedding, the database returns the closest matches and their associated metadata.
 
@@ -13,6 +13,7 @@ Search text is passed through Jina Embedding v4 to produce an embedding.  When q
 - Text: UTF-8 text files
 - PDF: `.pdf`
 - Document: `.csv` `.dbf` `.dif` `.doc` `.docm` `.docx` `.dot` `.dotm` `.dotx` `.fodg` `.fodp` `.fods` `.fodt` `.htm` `.html` `.mht` `.mhtml` `.odb` `.odc` `.odf` `.odg` `.odm` `.odp` `.ods` `.odt` `.oth` `.otp` `.ots` `.ott` `.otg` `.otm` `.pot` `.potm` `.potx` `.pps` `.ppsm` `.ppsx` `.ppt` `.pptm` `.pptx` `.rtf` `.sda` `.sdc` `.sdd` `.sdw` `.slk` `.sxc` `.sxd` `.sxg` `.sxi` `.sxm` `.sxw` `.tab` `.tsv` `.txt` `.uot` `.uop` `.uos` `.uof` `.vdx` `.vsd` `.vsdx` `.xhtml` `.xls` `.xlsm` `.xlsx` `.xlt` `.xltm` `.xltx` `.xml`
+- CAD / 3D: `.3ds` `.gltf` `.glb` `.obj` `.ply` `.stl` `.vtm` `.vti` `.vtk` `.vtp` `.vtr` `.vts` `.vtu` `.wrl` `.x3d`
 - Images: `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`
 - Audio: `.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.opus`, `.wav`, `.webm`
 - Video: `.avi`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.ts`, `.webm`
@@ -37,6 +38,14 @@ flowchart TD
     P --> P4[Render Pages to Images]
     P4 --> P5[Embed Page Images]
     P5 --> P6[Store Image Records]
+
+    B -->|CAD| C[Load CAD through F3D]
+    C --> C1[Extract F3D Text Metadata]
+    C1 --> C2[Embed Metadata Text]
+    C2 --> C3[Store CAD Text Records]
+    C --> C4[Render Cardinal Views]
+    C4 --> C5[Embed View Images]
+    C5 --> C6[Store CAD Image Records]
 
     B -->|Image| I[Load Image]
     I --> I1[Embed Image]
@@ -112,9 +121,23 @@ To force a device explicitly:
 cargo run -- --path /path/to/input-or-directory --device cuda
 ```
 
+CAD / 3D ingest example:
+
+```bash
+cargo run -- --path /path/to/cad-or-3d-directory --db wolfe.lance
+```
+
+CAD / 3D ingest with watch mode:
+
+```bash
+cargo run -- --path /path/to/cad-or-3d-directory --watch --db wolfe.lance
+```
+
 Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`.
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
+
+CAD ingestion requires `f3d` to be available on `PATH` with an offscreen rendering backend capable of writing `--output` images. Wolfe extracts text metadata from `f3d --no-render --verbose=debug` output and renders centered orthographic views from the front, back, left, right, top, and bottom directions. If F3D is installed but cannot render offscreen on your machine, CAD files will fail ingest with an F3D backend error.
 
 Music characterization runs when YAMNet flags audio as music. Wolfe sends the audio to Qwen Omni and stores the response as additional audio-derived text chunks for search. The prompt used is:
 
@@ -167,6 +190,8 @@ python -m pip install --upgrade pip
 python -m pip install pcre2
 python -m pip install "transformers>=4.57,<5" pillow peft requests pymupdf numpy scipy soundfile tensorflow tensorflow-hub --no-build-isolation
 ```
+
+Install F3D separately and ensure `f3d` is on `PATH` for CAD / 3D ingest.
 
 Install a PyTorch build that matches your hardware:
 
