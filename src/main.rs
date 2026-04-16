@@ -25,12 +25,8 @@ struct Args {
     path: Option<PathBuf>,
 
     /// Query string to vectorize and search semantically
-    #[arg(long, value_name = "TEXT", conflicts_with = "path")]
+    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "download_models"])]
     search: Option<String>,
-
-    /// Path to the local model directory
-    #[arg(long, default_value = "jina-embeddings-v4")]
-    model_dir: PathBuf,
 
     /// Embedding task name
     #[arg(long, default_value = "retrieval")]
@@ -87,6 +83,10 @@ struct Args {
     /// Watch for changes and keep the index up to date
     #[arg(long, requires = "path", conflicts_with = "search")]
     watch: bool,
+
+    /// Pre-download Jina, Whisper, Qwen, and YAMNet into their normal cache directories
+    #[arg(long, conflicts_with_all = ["path", "search", "watch"])]
+    download_models: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,8 +536,6 @@ async fn delete_path_records(
 fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>> {
     let mut child = Command::new(&args.python)
         .arg(&args.script)
-        .arg("--model-dir")
-        .arg(&args.model_dir)
         .arg("--task")
         .arg(&args.task)
         .arg("--device")
@@ -564,6 +562,23 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         writer: BufWriter::new(stdin),
         reader: BufReader::new(stdout),
     })
+}
+
+fn download_models(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new(&args.python)
+        .arg(&args.script)
+        .arg("--download-models")
+        .arg("--device")
+        .arg(&args.device)
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        return Err("model download script failed".into());
+    }
+
+    Ok(())
 }
 
 fn send_worker_file(session: &mut WorkerSession, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -829,8 +844,6 @@ async fn read_query_embedding(
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let mut child = Command::new(&args.python)
         .arg(&args.script)
-        .arg("--model-dir")
-        .arg(&args.model_dir)
         .arg("--task")
         .arg(&args.task)
         .arg("--device")
@@ -1015,6 +1028,9 @@ fn collect_files_recursive(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.download_models {
+        return download_models(&args);
+    }
     let table_target = resolve_table_target(&args.db);
     let ignore_matcher = load_ignore_matcher(&args)?;
     let mode = match (args.path.as_deref(), args.search.as_deref()) {

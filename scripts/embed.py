@@ -34,6 +34,7 @@ import torch
 import tensorflow as tf
 import tensorflow_hub as hub
 from PIL import Image
+from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor, Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 from transformers.utils.hub import cached_file
 
@@ -124,6 +125,7 @@ MIN_TOKEN_CHUNK_LIMIT = 1000
 YAMNET_SAMPLE_RATE = 16000
 YAMNET_TOP_CLASSES = 10
 YAMNET_TOP_FRAME_CLASSES = 25
+JINA_MODEL_ID = "jinaai/jina-embeddings-v4"
 WHISPER_MODEL_ID = "openai/whisper-large-v3"
 QWEN_OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni-7B"
 SPEECH_CLASS_KEYWORDS = (
@@ -539,8 +541,7 @@ def unload_qwen_omni_model() -> None:
 
 
 class JinaEmbedder:
-    def __init__(self, model_dir: Path, device: str) -> None:
-        self.model_dir = model_dir
+    def __init__(self, device: str) -> None:
         self.device = device
         self.model = None
         self.processor = None
@@ -549,11 +550,11 @@ class JinaEmbedder:
         if self.model is not None and self.processor is not None:
             return
         model = AutoModel.from_pretrained(
-            self.model_dir.as_posix(),
+            JINA_MODEL_ID,
             trust_remote_code=True,
         )
         processor = AutoProcessor.from_pretrained(
-            self.model_dir.as_posix(),
+            JINA_MODEL_ID,
             trust_remote_code=True,
             use_fast=True,
             fix_mistral_regex=True,
@@ -2191,9 +2192,15 @@ def detect_device(requested: str) -> str:
     return requested
 
 
+def download_models() -> None:
+    snapshot_download(JINA_MODEL_ID)
+    snapshot_download(WHISPER_MODEL_ID)
+    snapshot_download(QWEN_OMNI_MODEL_ID)
+    hub.load("https://tfhub.dev/google/yamnet/1")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Embed local files or query text using Jina Embeddings V4.")
-    parser.add_argument("--model-dir", required=True, type=Path, help="Path to the local model directory")
     parser.add_argument(
         "--task",
         default="retrieval",
@@ -2207,6 +2214,11 @@ def parse_args() -> argparse.Namespace:
         help="Execution device. Defaults to CUDA, then MPS, then CPU when available.",
     )
     parser.add_argument("--query-text", help="Query string to embed for semantic search")
+    parser.add_argument(
+        "--download-models",
+        action="store_true",
+        help="Pre-download Jina, Whisper, Qwen, and YAMNet into their normal cache directories",
+    )
     parser.add_argument(
         "--translate",
         action="store_true",
@@ -2231,8 +2243,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.query_text is None and not args.document_extensions:
+    if not args.download_models and args.query_text is None and not args.document_extensions:
         raise RuntimeError("--document-extensions is required for file ingest")
+    if args.download_models:
+        download_models()
+        return
     if args.document_extensions:
         extensions = {ext.strip().lower() for ext in args.document_extensions.split(",") if ext.strip()}
         if extensions:
@@ -2241,7 +2256,7 @@ def main() -> None:
     if args.low_memory:
         disable_tf_gpu()
     device = detect_device(args.device)
-    embedder = JinaEmbedder(args.model_dir, device)
+    embedder = JinaEmbedder(device)
 
     if args.query_text is not None:
         ensure_jina_loaded(embedder, args.low_memory)

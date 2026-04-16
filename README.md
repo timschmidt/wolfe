@@ -124,11 +124,17 @@ cargo run -- --path /path/to/input.txt
 Optional:
 
 ```bash
-cargo run -- --path /path/to/input-or-directory --model-dir jina-embeddings-v4 --task retrieval --python python3 --db wolfe.lance
+cargo run -- --path /path/to/input-or-directory --task retrieval --python python3 --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --low-memory --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --low-memory --qwen-max-memory 6000 --db wolfe.lance
+```
+
+Pre-download model caches:
+
+```bash
+cargo run -- --download-models
 ```
 
 Search:
@@ -199,7 +205,6 @@ Similar works: ""
 
 - `-p, --path PATH`: File or directory to embed recursively (conflicts with `--search`).
 - `--search TEXT`: Query string to vectorize and search semantically (conflicts with `--path`).
-- `--model-dir PATH`: Path to the local model directory (default: `jina-embeddings-v4`).
 - `--task TASK`: Embedding task name (default: `retrieval`).
 - `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
 - `--python PATH`: Path to the Python interpreter (default: `python3`).
@@ -214,6 +219,7 @@ Similar works: ""
 - `--ignore PATH`: File or directory name/path to ignore (repeatable).
 - `--ignore-file FILE`: File containing newline-separated ignore entries.
 - `--watch`: Watch for changes and keep the index up to date (requires `--path`).
+- `--download-models`: Pre-download Jina, Whisper, Qwen, and YAMNet into their normal cache directories and exit.
 
 Format notes for the CLI:
 
@@ -226,7 +232,7 @@ Format notes for the CLI:
 
 ## Setup
 
-I would like for Wolfe to be implemented in pure Rust, but currently running the Jina Embeddings V4 model requires the use of a Python wrapper.  Please file a PR or reach out if you know of a way to improve this.  Until then:
+I would like for Wolfe to be implemented in pure Rust, but currently running the Jina Embeddings V4 model requires the use of a Python wrapper. Please file a PR or reach out if you know of a way to improve this. Until then:
 
 ### Create a Python venv and install deps
 
@@ -264,6 +270,8 @@ python -m pip install torch torchvision
 
 The helper defaults to `--device auto`, which prefers CUDA, then MPS, then CPU.
 
+Jina, Whisper, and Qwen are downloaded and cached automatically through Hugging Face the first time they are needed. YAMNet is downloaded and cached automatically through TensorFlow Hub. You can also pre-warm those caches with `cargo run -- --download-models`.
+
 ### Workaround for pcre
 
 Set up this wrapper for pcre2 as pcre in the .venv
@@ -280,14 +288,12 @@ print("Wrote shim:", shim)
 PY
 ```
 
-### Ensure model files are present
+### Model caches
 
-```bash
-curl -sSfL https://hf.co/git-xet/install.sh | sh
-git clone https://huggingface.co/jinaai/jina-embeddings-v4
-```
+Wolfe uses the default library caches unless you override them with environment variables:
 
-or pass `--model-dir`
+- Hugging Face: typically `~/.cache/huggingface/hub`
+- TensorFlow Hub: typically `/tmp/tfhub_modules`
 
 ### Todo
 

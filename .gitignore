@@ -1,5 +1,4 @@
 /target
-/jina-embeddings-v4
 /.venv
 /scripts/__pycache__/
 /wolfe.lance
