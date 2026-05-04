@@ -580,6 +580,7 @@ class JinaEmbedder:
         )
         model.processor = processor
         model.to(self.device)
+        patch_jina_batch_autocast(model, self.device)
         model.eval()
         if hasattr(model, "verbosity"):
             model.verbosity = 0
@@ -604,6 +605,98 @@ class JinaEmbedder:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def cuda_autocast_dtype(device: str):
+    if not is_cuda_device(device):
+        return torch.float32
+    capability = torch.cuda.get_device_capability(cuda_device_index(device))
+    if capability[0] < 8:
+        return torch.float16
+    return torch.bfloat16
+
+
+def patch_jina_batch_autocast(model, device: str) -> None:
+    if not is_cuda_device(device):
+        return
+
+    autocast_dtype = cuda_autocast_dtype(device)
+    if autocast_dtype == torch.bfloat16:
+        return
+
+    def _process_batches(
+        self,
+        data,
+        task_label,
+        processor_fn,
+        desc,
+        return_multivector=False,
+        return_numpy=False,
+        batch_size=32,
+        truncate_dim=None,
+    ):
+        from torch.utils.data import DataLoader
+        from tqdm import tqdm
+
+        dataloader = DataLoader(
+            dataset=data,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=processor_fn,
+        )
+        if return_multivector and len(data) > 1:
+            assert not return_numpy, (
+                "`return_numpy` is not supported when `return_multivector=True` "
+                "and more than one data is encoded"
+            )
+        results = []
+        self.eval()
+        for batch in tqdm(dataloader, desc=desc, disable=self.verbosity == 0):
+            with torch.no_grad():
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                with torch.autocast(
+                    device_type=torch.device(self.device).type,
+                    dtype=autocast_dtype,
+                ):
+                    embeddings = self(**batch, task_label=task_label)
+                    if not return_multivector:
+                        embeddings = embeddings.single_vec_emb
+                        if truncate_dim is not None:
+                            embeddings = embeddings[:, :truncate_dim]
+                            embeddings = torch.nn.functional.normalize(
+                                embeddings, p=2, dim=-1
+                            )
+                    else:
+                        embeddings = embeddings.multi_vec_emb
+
+                    if return_multivector and not return_numpy:
+                        valid_tokens = batch["attention_mask"].bool()
+                        embeddings = [
+                            emb[mask] for emb, mask in zip(embeddings, valid_tokens)
+                        ]
+                        results.append(embeddings)
+                    else:
+                        results.append(
+                            embeddings.cpu()
+                            if return_numpy
+                            else list(torch.unbind(embeddings))
+                        )
+        if return_numpy:
+            return np.concatenate([result.numpy() for result in results], axis=0)
+        return [item for sublist in results for item in sublist]
+
+    patch_targets = [model]
+    if hasattr(model, "get_base_model"):
+        try:
+            patch_targets.append(model.get_base_model())
+        except Exception:
+            pass
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        patch_targets.append(model.base_model.model)
+
+    for target in patch_targets:
+        if hasattr(target, "_process_batches"):
+            target._process_batches = _process_batches.__get__(target, type(target))
 
 
 def ensure_jina_loaded(embedder: JinaEmbedder, low_memory: bool) -> None:
