@@ -28,7 +28,7 @@ from html import unescape as html_unescape
 
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
-    "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.7",
+    "max_split_size_mb:64,garbage_collection_threshold:0.7",
 )
 
 import fitz
