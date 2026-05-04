@@ -145,6 +145,18 @@ cargo run -- --search "error handling in rust" --db wolfe.lance --range 10:20
 cargo run -- --search "error handling in rust" --db wolfe.lance --json
 ```
 
+Web search UI:
+
+```bash
+cargo run -- --web --db wolfe.lance --listen 127.0.0.1:8767
+```
+
+The web mode serves a local browser UI and JSON endpoints for semantic search
+and neighboring context chunks:
+
+- `GET /api/search?q=...&limit=20&offset=0`
+- `GET /api/context?path=...&chunk=0&window=2`
+
 Watch for changes:
 
 ```bash
@@ -205,6 +217,8 @@ Similar works: ""
 
 - `-p, --path PATH`: File or directory to embed recursively (conflicts with `--search`).
 - `--search TEXT`: Query string to vectorize and search semantically (conflicts with `--path`).
+- `--web`: Run a local web UI for browsing semantic search results.
+- `--listen ADDR`: Listen address for `--web` (default: `127.0.0.1:8767`).
 - `--task TASK`: Embedding task name (default: `retrieval`).
 - `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
 - `--python PATH`: Path to the Python interpreter (default: `python3`).

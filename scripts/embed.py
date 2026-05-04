@@ -14,7 +14,12 @@ import sys
 import tempfile
 import zipfile
 import tarfile
-from datetime import UTC, datetime
+try:
+    from datetime import UTC, datetime
+except ImportError:
+    from datetime import datetime, timezone
+
+    UTC = timezone.utc
 from email import policy
 from email.parser import BytesParser
 from io import BytesIO
@@ -31,8 +36,12 @@ import numpy as np
 import scipy.signal
 import soundfile as sf
 import torch
-import tensorflow as tf
-import tensorflow_hub as hub
+try:
+    import tensorflow as tf
+    import tensorflow_hub as hub
+except ImportError:
+    tf = None
+    hub = None
 from PIL import Image
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor, Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
@@ -374,6 +383,8 @@ def load_audio_classifier():
     global _AUDIO_CLASSIFIER, _AUDIO_CLASS_NAMES
     if _AUDIO_CLASSIFIER is not None:
         return _AUDIO_CLASSIFIER, _AUDIO_CLASS_NAMES
+    if tf is None or hub is None:
+        raise RuntimeError("tensorflow and tensorflow_hub are required for audio classification")
 
     disable_tf_gpu()
     classifier = hub.load("https://tfhub.dev/google/yamnet/1")
@@ -392,10 +403,11 @@ def unload_audio_classifier() -> None:
     global _AUDIO_CLASSIFIER, _AUDIO_CLASS_NAMES
     _AUDIO_CLASSIFIER = None
     _AUDIO_CLASS_NAMES = None
-    try:
-        tf.keras.backend.clear_session()
-    except Exception:
-        pass
+    if tf is not None:
+        try:
+            tf.keras.backend.clear_session()
+        except Exception:
+            pass
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -405,6 +417,9 @@ def disable_tf_gpu() -> None:
     """Ensure TensorFlow uses CPU only to save VRAM for other models."""
     global _TF_GPU_DISABLED
     if _TF_GPU_DISABLED:
+        return
+    if tf is None:
+        _TF_GPU_DISABLED = True
         return
     try:
         if tf.config.list_physical_devices("GPU"):
@@ -2196,6 +2211,8 @@ def download_models() -> None:
     snapshot_download(JINA_MODEL_ID)
     snapshot_download(WHISPER_MODEL_ID)
     snapshot_download(QWEN_OMNI_MODEL_ID)
+    if hub is None:
+        raise RuntimeError("tensorflow_hub is required to download YAMNet")
     hub.load("https://tfhub.dev/google/yamnet/1")
 
 

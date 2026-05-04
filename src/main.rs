@@ -1,27 +1,42 @@
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::channel;
 use std::sync::Arc;
+use std::sync::mpsc::channel;
 use std::{collections::HashSet, env};
 
 use arrow_array::types::Float32Type;
-use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, Float64Array, RecordBatch, RecordBatchIterator,
+    StringArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse};
+use axum::routing::get;
+use axum::{Json, Router};
 use clap::Parser;
 use futures::StreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table, connect};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
     /// Path to a file or directory to embed recursively
-    #[arg(short, long, value_name = "PATH", alias = "file", conflicts_with = "search")]
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        alias = "file",
+        conflicts_with = "search"
+    )]
     path: Option<PathBuf>,
 
     /// Query string to vectorize and search semantically
@@ -87,6 +102,14 @@ struct Args {
     /// Pre-download Jina, Whisper, Qwen, and YAMNet into their normal cache directories
     #[arg(long, conflicts_with_all = ["path", "search", "watch"])]
     download_models: bool,
+
+    /// Run the local web search UI instead of ingesting or running one CLI search
+    #[arg(long, conflicts_with_all = ["path", "search", "download_models", "watch"])]
+    web: bool,
+
+    /// Listen address for --web
+    #[arg(long, default_value = "127.0.0.1:8767", requires = "web")]
+    listen: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +140,70 @@ struct QueryRecord {
 enum Mode<'a> {
     Ingest(&'a Path),
     Search(&'a str),
+    Web,
+}
+
+#[derive(Clone)]
+struct WebState {
+    db_root: PathBuf,
+    table_name: String,
+    query_config: QueryConfig,
+}
+
+#[derive(Clone)]
+struct QueryConfig {
+    python: String,
+    script: PathBuf,
+    task: String,
+    device: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchParams {
+    q: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextParams {
+    path: String,
+    chunk: Option<u32>,
+    offset: Option<u64>,
+    window: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    query: String,
+    limit: usize,
+    offset: usize,
+    results: Vec<SearchRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextResponse {
+    path: String,
+    window: u32,
+    results: Vec<SearchRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchRow {
+    record_id: String,
+    path: String,
+    file_name: String,
+    extension: String,
+    parent_dir: String,
+    modality: String,
+    chunk: u32,
+    offset: u64,
+    display_offset: u64,
+    unit: &'static str,
+    snippet: String,
+    size_bytes: u64,
+    modified_at: String,
+    distance: Option<f64>,
 }
 
 struct TableTarget {
@@ -234,7 +321,10 @@ fn path_matches_ignore_name(path: &Path, matcher: &IgnoreMatcher) -> bool {
 }
 
 fn path_matches_ignore_path(path: &Path, matcher: &IgnoreMatcher) -> bool {
-    matcher.paths.iter().any(|ignored| path.starts_with(ignored))
+    matcher
+        .paths
+        .iter()
+        .any(|ignored| path.starts_with(ignored))
 }
 
 fn should_ignore_path(path: &Path, matcher: &IgnoreMatcher) -> bool {
@@ -265,7 +355,10 @@ fn build_schema(embedding_dim: i32) -> SchemaRef {
     ]))
 }
 
-fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+fn build_batch(
+    records: &[WorkerRecord],
+    embedding_dim: i32,
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
     let schema = build_schema(embedding_dim);
     let record_ids = StringArray::from_iter_values(
         records
@@ -293,14 +386,17 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
             .iter()
             .map(|record| record.modality.as_deref().unwrap_or("")),
     );
-    let chunks = UInt32Array::from_iter_values(records.iter().map(|record| record.chunk.unwrap_or(0)));
-    let offsets = UInt64Array::from_iter_values(records.iter().map(|record| record.offset.unwrap_or(0)));
+    let chunks =
+        UInt32Array::from_iter_values(records.iter().map(|record| record.chunk.unwrap_or(0)));
+    let offsets =
+        UInt64Array::from_iter_values(records.iter().map(|record| record.offset.unwrap_or(0)));
     let plaintexts = StringArray::from_iter_values(
         records
             .iter()
             .map(|record| record.plaintext.as_deref().unwrap_or("")),
     );
-    let sizes = UInt64Array::from_iter_values(records.iter().map(|record| record.size_bytes.unwrap_or(0)));
+    let sizes =
+        UInt64Array::from_iter_values(records.iter().map(|record| record.size_bytes.unwrap_or(0)));
     let modified_ats = StringArray::from_iter_values(
         records
             .iter()
@@ -308,7 +404,10 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
     );
     let embeddings = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         records.iter().map(|record| {
-            let vector = record.embedding.as_ref().expect("missing embedding for stored record");
+            let vector = record
+                .embedding
+                .as_ref()
+                .expect("missing embedding for stored record");
             Some(vector.iter().copied().map(Some).collect::<Vec<_>>())
         }),
         embedding_dim,
@@ -335,81 +434,13 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
 
 // Source of truth for document extensions passed to the Python worker.
 const DOCUMENT_EXTENSIONS: &[&str] = &[
-    ".csv",
-    ".dbf",
-    ".dif",
-    ".doc",
-    ".docm",
-    ".docx",
-    ".dot",
-    ".dotm",
-    ".dotx",
-    ".fodg",
-    ".fodp",
-    ".fods",
-    ".fodt",
-    ".htm",
-    ".html",
-    ".mht",
-    ".mhtml",
-    ".odb",
-    ".odc",
-    ".odf",
-    ".odg",
-    ".odm",
-    ".odp",
-    ".ods",
-    ".odt",
-    ".oth",
-    ".otp",
-    ".ots",
-    ".ott",
-    ".otg",
-    ".otm",
-    ".pot",
-    ".potm",
-    ".potx",
-    ".pps",
-    ".ppsm",
-    ".ppsx",
-    ".ppt",
-    ".pptm",
-    ".pptx",
-    ".rtf",
-    ".sda",
-    ".sdc",
-    ".sdd",
-    ".sdw",
-    ".slk",
-    ".sxc",
-    ".sxd",
-    ".sxg",
-    ".sxi",
-    ".sxm",
-    ".sxw",
-    ".tab",
-    ".tsv",
-    ".txt",
-    ".uot",
-    ".uop",
-    ".uos",
-    ".uof",
-    ".vdx",
-    ".vsd",
-    ".vsdx",
-    ".wp",
-    ".wp5",
-    ".wp6",
-    ".wpd",
-    ".svg",
-    ".xhtml",
-    ".xls",
-    ".xlsm",
-    ".xlsx",
-    ".xlt",
-    ".xltm",
-    ".xltx",
-    ".xml",
+    ".csv", ".dbf", ".dif", ".doc", ".docm", ".docx", ".dot", ".dotm", ".dotx", ".fodg", ".fodp",
+    ".fods", ".fodt", ".htm", ".html", ".mht", ".mhtml", ".odb", ".odc", ".odf", ".odg", ".odm",
+    ".odp", ".ods", ".odt", ".oth", ".otp", ".ots", ".ott", ".otg", ".otm", ".pot", ".potm",
+    ".potx", ".pps", ".ppsm", ".ppsx", ".ppt", ".pptm", ".pptx", ".rtf", ".sda", ".sdc", ".sdd",
+    ".sdw", ".slk", ".sxc", ".sxd", ".sxg", ".sxi", ".sxm", ".sxw", ".tab", ".tsv", ".txt", ".uot",
+    ".uop", ".uos", ".uof", ".vdx", ".vsd", ".vsdx", ".wp", ".wp5", ".wp6", ".wpd", ".svg",
+    ".xhtml", ".xls", ".xlsm", ".xlsx", ".xlt", ".xltm", ".xltx", ".xml",
 ];
 
 fn is_document_extension(extension: &str) -> bool {
@@ -424,10 +455,37 @@ fn snippet_unit(modality: &str, extension: &str) -> &'static str {
     if extension == ".pdf" || is_document_extension(extension) {
         return "page";
     }
-    if matches!(extension, ".3gp" | ".mp4" | ".m2ts" | ".mkv" | ".mov" | ".avi" | ".m4v" | ".mpeg" | ".mpg" | ".ts" | ".webm") {
+    if matches!(
+        extension,
+        ".3gp"
+            | ".mp4"
+            | ".m2ts"
+            | ".mkv"
+            | ".mov"
+            | ".avi"
+            | ".m4v"
+            | ".mpeg"
+            | ".mpg"
+            | ".ts"
+            | ".webm"
+    ) {
         return "frame";
     }
-    if modality == "audio" || matches!(extension, ".aac" | ".aif" | ".aiff" | ".au" | ".flac" | ".m4a" | ".mp3" | ".ogg" | ".opus" | ".wav") {
+    if modality == "audio"
+        || matches!(
+            extension,
+            ".aac"
+                | ".aif"
+                | ".aiff"
+                | ".au"
+                | ".flac"
+                | ".m4a"
+                | ".mp3"
+                | ".ogg"
+                | ".opus"
+                | ".wav"
+        )
+    {
         return "second";
     }
     if modality == "text" {
@@ -441,6 +499,15 @@ fn display_offset(extension: &str, offset: u64) -> u64 {
         offset + 1
     } else {
         offset
+    }
+}
+
+fn query_config_from_args(args: &Args) -> QueryConfig {
+    QueryConfig {
+        python: args.python.clone(),
+        script: args.script.clone(),
+        task: args.task.clone(),
+        device: args.device.clone(),
     }
 }
 
@@ -469,7 +536,7 @@ async fn flush_records(
         Some(existing_dim) if *existing_dim != current_dim => {
             return Err(
                 format!("embedding dimension changed from {existing_dim} to {current_dim}").into(),
-            )
+            );
         }
         None => *embedding_dim = Some(current_dim),
         _ => {}
@@ -546,20 +613,34 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg(&args.device)
         .arg("--document-extensions")
         .arg(document_extensions_arg())
-        .args(if args.translate { vec!["--translate"] } else { Vec::new() })
+        .args(if args.translate {
+            vec!["--translate"]
+        } else {
+            Vec::new()
+        })
         .args(
             args.qwen_max_memory
                 .map(|value| vec!["--qwen-max-memory".to_string(), value.to_string()])
                 .unwrap_or_default(),
         )
-        .args(if args.low_memory { vec!["--low-memory"] } else { Vec::new() })
+        .args(if args.low_memory {
+            vec!["--low-memory"]
+        } else {
+            Vec::new()
+        })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdin = child.stdin.take().ok_or("failed to open embedding worker stdin")?;
-    let stdout = child.stdout.take().ok_or("failed to open embedding worker stdout")?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or("failed to open embedding worker stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("failed to open embedding worker stdout")?;
 
     Ok(WorkerSession {
         child,
@@ -585,7 +666,10 @@ fn download_models(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn send_worker_file(session: &mut WorkerSession, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn send_worker_file(
+    session: &mut WorkerSession,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let request = json!({
         "type": "file",
         "path": path.to_string_lossy(),
@@ -658,7 +742,8 @@ async fn ingest_single_path(
         }
     }
 
-    summary.stored += flush_records(connection, table_name, table, &mut pending, embedding_dim).await?;
+    summary.stored +=
+        flush_records(connection, table_name, table, &mut pending, embedding_dim).await?;
     Ok(summary)
 }
 
@@ -710,12 +795,7 @@ async fn run_ingest(
     };
 
     for (index, file) in files.into_iter().enumerate() {
-        eprintln!(
-            "ingest {}/{}: {}",
-            index + 1,
-            total_files,
-            file.display()
-        );
+        eprintln!("ingest {}/{}: {}", index + 1, total_files, file.display());
         let file_summary = ingest_single_path(
             &mut session,
             connection,
@@ -763,7 +843,10 @@ async fn run_watch(
     let watched_root = if watch_target.is_dir() {
         watch_target.clone()
     } else {
-        watch_target.parent().unwrap_or(Path::new(".")).to_path_buf()
+        watch_target
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
     };
     let target_file = if watch_target.is_file() {
         Some(watch_target.clone())
@@ -843,22 +926,25 @@ async fn run_watch(
 }
 
 async fn read_query_embedding(
-    args: &Args,
+    config: &QueryConfig,
     query: &str,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let mut child = Command::new(&args.python)
-        .arg(&args.script)
+    let mut child = Command::new(&config.python)
+        .arg(&config.script)
         .arg("--task")
-        .arg(&args.task)
+        .arg(&config.task)
         .arg("--device")
-        .arg(&args.device)
+        .arg(&config.device)
         .arg("--query-text")
         .arg(query)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdout = child.stdout.take().ok_or("failed to open query worker stdout")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("failed to open query worker stdout")?;
     let reader = BufReader::new(stdout);
     let mut embedding = None;
 
@@ -886,24 +972,96 @@ async fn read_query_embedding(
     embedding.ok_or_else(|| "query worker did not return an embedding".into())
 }
 
-async fn run_search(
-    args: &Args,
-    connection: &Connection,
-    table_target: &TableTarget,
-    query: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (range_start, range_end) = if let Some(range_value) = args.range.as_deref() {
-        let (start, end) = parse_range(range_value).map_err(|err| format!("invalid --range: {err}"))?;
-        (start, Some(end))
-    } else {
-        (0, None)
-    };
-    let effective_limit = range_end.unwrap_or(args.limit);
+fn column_string(
+    batch: &RecordBatch,
+    name: &str,
+    index: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let array = batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("search result missing {name} column"))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| format!("{name} column is not Utf8"))?;
+    Ok(array.value(index).to_string())
+}
 
-    let table = open_table(connection, &table_target.table_name)
+fn column_u32(batch: &RecordBatch, name: &str, index: usize) -> u32 {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
+        .map(|array| array.value(index))
+        .unwrap_or(0)
+}
+
+fn column_u64(batch: &RecordBatch, name: &str, index: usize) -> u64 {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .map(|array| array.value(index))
+        .unwrap_or(0)
+}
+
+fn column_distance(batch: &RecordBatch, index: usize) -> Option<f64> {
+    if let Some(array) = batch
+        .column_by_name("_distance")
+        .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
+    {
+        return Some(array.value(index) as f64);
+    }
+    batch
+        .column_by_name("_distance")
+        .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+        .map(|array| array.value(index))
+}
+
+fn row_from_batch(
+    batch: &RecordBatch,
+    index: usize,
+) -> Result<SearchRow, Box<dyn std::error::Error>> {
+    let record_id = column_string(batch, "record_id", index)?;
+    let path = column_string(batch, "path", index)?;
+    let file_name = column_string(batch, "file_name", index)?;
+    let extension = column_string(batch, "extension", index)?;
+    let parent_dir = column_string(batch, "parent_dir", index)?;
+    let modality = column_string(batch, "modality", index)?;
+    let chunk = column_u32(batch, "chunk", index);
+    let offset = column_u64(batch, "offset", index);
+    let snippet = column_string(batch, "plaintext", index)?.replace(['\t', '\n'], " ");
+    let unit = snippet_unit(&modality, &extension);
+    let display_offset = display_offset(&extension, offset);
+    Ok(SearchRow {
+        record_id,
+        path,
+        file_name,
+        extension,
+        parent_dir,
+        modality,
+        chunk,
+        offset,
+        display_offset,
+        unit,
+        snippet,
+        size_bytes: column_u64(batch, "size_bytes", index),
+        modified_at: column_string(batch, "modified_at", index)?,
+        distance: column_distance(batch, index),
+    })
+}
+
+async fn search_rows(
+    query_config: &QueryConfig,
+    connection: &Connection,
+    table_name: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<SearchRow>, Box<dyn std::error::Error>> {
+    let effective_limit = limit.saturating_add(offset);
+
+    let table = open_table(connection, table_name)
         .await
         .ok_or("search table does not exist")?;
-    let query_vector = read_query_embedding(args, query).await?;
+    let query_vector = read_query_embedding(query_config, query).await?;
     let mut results = table
         .vector_search(query_vector)?
         .limit(effective_limit)
@@ -911,83 +1069,460 @@ async fn run_search(
         .await?;
 
     let mut global_index = 0usize;
-    let mut json_rows: Vec<serde_json::Value> = Vec::new();
+    let mut rows = Vec::new();
     while let Some(batch) = results.next().await {
         let batch = batch?;
-        let paths = batch
-            .column_by_name("path")
-            .ok_or("search result missing path column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("path column is not Utf8")?;
-        let file_names = batch
-            .column_by_name("file_name")
-            .ok_or("search result missing file_name column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("file_name column is not Utf8")?;
-        let extensions = batch
-            .column_by_name("extension")
-            .ok_or("search result missing extension column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("extension column is not Utf8")?;
-        let modalities = batch
-            .column_by_name("modality")
-            .ok_or("search result missing modality column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("modality column is not Utf8")?;
-        let offsets = batch
-            .column_by_name("offset")
-            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>());
-        let plaintexts = batch
-            .column_by_name("plaintext")
-            .and_then(|column| column.as_any().downcast_ref::<StringArray>());
-
         for index in 0..batch.num_rows() {
-            if global_index < range_start {
+            if global_index < offset {
                 global_index += 1;
                 continue;
             }
-            if let Some(end) = range_end && global_index >= end {
-                return Ok(());
+            if rows.len() >= limit {
+                return Ok(rows);
             }
-            let path = paths.value(index);
-            let file_name = file_names.value(index);
-            let modality = modalities.value(index);
-            let extension = extensions.value(index);
-            let offset = offsets.map(|array| array.value(index)).unwrap_or(0);
-            let unit = snippet_unit(modality, extension);
-            let resolved_offset = display_offset(extension, offset);
-            let snippet_text = plaintexts
-                .map(|array| array.value(index))
-                .unwrap_or("")
-                .replace(['\t', '\n'], " ");
-            if args.json {
-                json_rows.push(json!({
-                    "path": path,
-                    "file_name": file_name,
-                    "modality": modality,
-                    "unit": unit,
-                    "offset": resolved_offset,
-                    "snippet": snippet_text,
-                }));
-            } else {
-                println!("{path}\t{file_name}\t{modality}\t{unit}:{resolved_offset}\t{snippet_text}");
-            }
+            rows.push(row_from_batch(&batch, index)?);
             global_index += 1;
         }
     }
 
+    Ok(rows)
+}
+
+async fn run_search(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+    query: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (range_start, range_end) = if let Some(range_value) = args.range.as_deref() {
+        let (start, end) =
+            parse_range(range_value).map_err(|err| format!("invalid --range: {err}"))?;
+        (start, Some(end))
+    } else {
+        (0, None)
+    };
+    let effective_limit = range_end.map(|end| end - range_start).unwrap_or(args.limit);
+    let rows = search_rows(
+        &query_config_from_args(args),
+        connection,
+        &table_target.table_name,
+        query,
+        effective_limit,
+        range_start,
+    )
+    .await?;
+
     if args.json {
-        println!("{}", serde_json::to_string(&json_rows)?);
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        for row in rows {
+            println!(
+                "{}\t{}\t{}\t{}:{}\t{}",
+                row.path, row.file_name, row.modality, row.unit, row.display_offset, row.snippet
+            );
+        }
     }
 
     Ok(())
 }
 
-fn collect_files(path: &Path, ignore_matcher: &IgnoreMatcher) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+async fn connect_web_state(state: &WebState) -> Result<Connection, String> {
+    connect(state.db_root.to_string_lossy().as_ref())
+        .execute()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn web_search(
+    State(state): State<WebState>,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    let query = params.q.trim().to_string();
+    if query.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query must not be empty".to_string(),
+        ));
+    }
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0);
+    let connection = connect_web_state(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let results = search_rows(
+        &state.query_config,
+        &connection,
+        &state.table_name,
+        &query,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(SearchResponse {
+        query,
+        limit,
+        offset,
+        results,
+    }))
+}
+
+async fn context_rows(
+    connection: &Connection,
+    table_name: &str,
+    params: &ContextParams,
+) -> Result<Vec<SearchRow>, Box<dyn std::error::Error>> {
+    let table = open_table(connection, table_name)
+        .await
+        .ok_or("search table does not exist")?;
+    let window = params.window.unwrap_or(2).min(20);
+    let path_filter = format!("path = {}", sql_quote(&params.path));
+    let filter = if let Some(chunk) = params.chunk {
+        let start = chunk.saturating_sub(window);
+        let end = chunk.saturating_add(window);
+        format!("{path_filter} AND chunk >= {start} AND chunk <= {end}")
+    } else if let Some(offset) = params.offset {
+        let span = u64::from(window).saturating_mul(2);
+        let start = offset.saturating_sub(span);
+        let end = offset.saturating_add(span);
+        format!("{path_filter} AND offset >= {start} AND offset <= {end}")
+    } else {
+        path_filter
+    };
+
+    let mut results = table
+        .query()
+        .only_if(filter)
+        .limit((window as usize * 2 + 1).max(20))
+        .execute()
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = results.next().await {
+        let batch = batch?;
+        for index in 0..batch.num_rows() {
+            rows.push(row_from_batch(&batch, index)?);
+        }
+    }
+    rows.sort_by(|left, right| {
+        left.chunk
+            .cmp(&right.chunk)
+            .then(left.offset.cmp(&right.offset))
+            .then(left.record_id.cmp(&right.record_id))
+    });
+    Ok(rows)
+}
+
+async fn web_context(
+    State(state): State<WebState>,
+    Query(params): Query<ContextParams>,
+) -> Result<Json<ContextResponse>, (StatusCode, String)> {
+    if params.path.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path must not be empty".to_string(),
+        ));
+    }
+    let connection = connect_web_state(&state)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let results = context_rows(&connection, &state.table_name, &params)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(ContextResponse {
+        path: params.path,
+        window: params.window.unwrap_or(2).min(20),
+        results,
+    }))
+}
+
+async fn web_index() -> impl IntoResponse {
+    Html(WEB_INDEX)
+}
+
+async fn run_web(
+    args: &Args,
+    table_target: &TableTarget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = WebState {
+        db_root: table_target.db_root.clone(),
+        table_name: table_target.table_name.clone(),
+        query_config: query_config_from_args(args),
+    };
+    let app = Router::new()
+        .route("/", get(web_index))
+        .route("/api/search", get(web_search))
+        .route("/api/context", get(web_context))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    eprintln!("wolfe web listening on http://{}", args.listen);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+const WEB_INDEX: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wolfe Search</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f4;
+      --panel: #ffffff;
+      --ink: #1d2528;
+      --muted: #667176;
+      --line: #d9dedb;
+      --accent: #246b58;
+      --accent-strong: #16483d;
+      --warn: #8f4c21;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: #eef1ec;
+      padding: 14px 20px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 18px;
+      padding: 18px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 92px 96px;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    input, button {
+      font: inherit;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      background: var(--panel);
+      color: var(--ink);
+    }
+    button {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button.secondary {
+      background: var(--panel);
+      border-color: var(--line);
+      color: var(--accent-strong);
+      padding: 6px 9px;
+      font-size: 13px;
+    }
+    button:disabled { opacity: .55; cursor: default; }
+    .status {
+      color: var(--muted);
+      min-height: 22px;
+      margin-bottom: 8px;
+    }
+    .results {
+      display: grid;
+      gap: 10px;
+    }
+    article, aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    article {
+      padding: 12px;
+    }
+    .result-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+    .file {
+      font-weight: 650;
+      word-break: break-word;
+    }
+    .path, .meta {
+      color: var(--muted);
+      font-size: 12px;
+      word-break: break-all;
+    }
+    .snippet {
+      margin: 8px 0;
+      white-space: pre-wrap;
+    }
+    aside {
+      padding: 12px;
+      position: sticky;
+      top: 18px;
+      align-self: start;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+    }
+    aside h2 {
+      font-size: 15px;
+      margin: 0 0 10px;
+    }
+    .context-row {
+      border-top: 1px solid var(--line);
+      padding: 10px 0;
+    }
+    .context-row:first-of-type {
+      border-top: 0;
+    }
+    .empty {
+      color: var(--muted);
+      padding: 14px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      background: rgba(255,255,255,.6);
+    }
+    .error { color: var(--warn); }
+    @media (max-width: 880px) {
+      main { grid-template-columns: 1fr; padding: 12px; }
+      form { grid-template-columns: 1fr; }
+      aside { position: static; max-height: none; }
+    }
+  </style>
+</head>
+<body>
+  <header><h1>Wolfe Search</h1></header>
+  <main>
+    <section>
+      <form id="search-form">
+        <input id="query" name="q" autocomplete="off" placeholder="Search the Wolfe corpus" required>
+        <input id="limit" name="limit" type="number" min="1" max="100" value="20" title="Limit">
+        <button id="search-button" type="submit">Search</button>
+      </form>
+      <div id="status" class="status"></div>
+      <div id="results" class="results"></div>
+    </section>
+    <aside>
+      <h2>Context</h2>
+      <div id="context" class="empty">Select a result to browse neighboring chunks.</div>
+    </aside>
+  </main>
+  <script>
+    const form = document.getElementById('search-form');
+    const queryInput = document.getElementById('query');
+    const limitInput = document.getElementById('limit');
+    const button = document.getElementById('search-button');
+    const statusBox = document.getElementById('status');
+    const resultsBox = document.getElementById('results');
+    const contextBox = document.getElementById('context');
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[ch]));
+    }
+
+    function meta(row) {
+      const distance = row.distance == null ? '' : ` distance ${Number(row.distance).toFixed(4)}`;
+      return `${row.modality} ${row.extension || ''} ${row.unit}:${row.display_offset} chunk ${row.chunk}${distance}`;
+    }
+
+    function renderResults(rows) {
+      if (!rows.length) {
+        resultsBox.innerHTML = '<div class="empty">No results.</div>';
+        return;
+      }
+      resultsBox.innerHTML = rows.map((row, index) => `
+        <article>
+          <div class="result-head">
+            <div>
+              <div class="file">${escapeHtml(row.file_name || row.path)}</div>
+              <div class="path">${escapeHtml(row.path)}</div>
+              <div class="meta">${escapeHtml(meta(row))}</div>
+            </div>
+            <button class="secondary" type="button" data-index="${index}">Context</button>
+          </div>
+          <div class="snippet">${escapeHtml(row.snippet)}</div>
+        </article>
+      `).join('');
+      resultsBox.querySelectorAll('button[data-index]').forEach((node) => {
+        node.addEventListener('click', () => loadContext(rows[Number(node.dataset.index)]));
+      });
+    }
+
+    function renderContext(payload) {
+      if (!payload.results.length) {
+        contextBox.className = 'empty';
+        contextBox.textContent = 'No context rows found.';
+        return;
+      }
+      contextBox.className = '';
+      contextBox.innerHTML = payload.results.map((row) => `
+        <div class="context-row">
+          <div class="meta">${escapeHtml(meta(row))}</div>
+          <div>${escapeHtml(row.snippet)}</div>
+        </div>
+      `).join('');
+    }
+
+    async function loadContext(row) {
+      contextBox.className = 'empty';
+      contextBox.textContent = 'Loading context...';
+      const params = new URLSearchParams({
+        path: row.path,
+        chunk: row.chunk,
+        window: '2'
+      });
+      const response = await fetch(`/api/context?${params}`);
+      if (!response.ok) {
+        contextBox.className = 'empty error';
+        contextBox.textContent = await response.text();
+        return;
+      }
+      renderContext(await response.json());
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const q = queryInput.value.trim();
+      if (!q) return;
+      button.disabled = true;
+      statusBox.textContent = 'Searching...';
+      resultsBox.innerHTML = '';
+      const params = new URLSearchParams({ q, limit: limitInput.value || '20' });
+      try {
+        const response = await fetch(`/api/search?${params}`);
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        statusBox.textContent = `${payload.results.length} results for "${payload.query}"`;
+        renderResults(payload.results);
+      } catch (err) {
+        statusBox.innerHTML = `<span class="error">${escapeHtml(err.message || err)}</span>`;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+"#;
+
+fn collect_files(
+    path: &Path,
+    ignore_matcher: &IgnoreMatcher,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     if should_ignore_path(path, ignore_matcher) {
         return Ok(Vec::new());
     }
@@ -997,7 +1532,11 @@ fn collect_files(path: &Path, ignore_matcher: &IgnoreMatcher) -> Result<Vec<Path
     }
 
     if !path.is_dir() {
-        return Err(format!("path does not exist or is not accessible: {}", path.display()).into());
+        return Err(format!(
+            "path does not exist or is not accessible: {}",
+            path.display()
+        )
+        .into());
     }
 
     let mut files = Vec::new();
@@ -1037,15 +1576,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let table_target = resolve_table_target(&args.db);
     let ignore_matcher = load_ignore_matcher(&args)?;
-    let mode = match (args.path.as_deref(), args.search.as_deref()) {
-        (Some(path), None) => Mode::Ingest(path),
-        (None, Some(query)) => Mode::Search(query),
-        (Some(_), Some(_)) => return Err("use either --path or --search, not both".into()),
-        (None, None) => return Err("either --path or --search is required".into()),
+    let mode = match (args.web, args.path.as_deref(), args.search.as_deref()) {
+        (true, None, None) => Mode::Web,
+        (false, Some(path), None) => Mode::Ingest(path),
+        (false, None, Some(query)) => Mode::Search(query),
+        (false, Some(_), Some(_)) => return Err("use either --path or --search, not both".into()),
+        (true, _, _) => return Err("--web cannot be combined with --path or --search".into()),
+        (false, None, None) => return Err("either --path, --search, or --web is required".into()),
     };
 
     if matches!(mode, Mode::Ingest(_)) {
         fs::create_dir_all(&table_target.db_root)?;
+    }
+
+    if matches!(mode, Mode::Web) {
+        return run_web(&args, &table_target).await;
     }
 
     let connection = connect(table_target.db_root.to_string_lossy().as_ref())
@@ -1059,11 +1604,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root_path = match mode {
         Mode::Ingest(path) => path,
         Mode::Search(_) => unreachable!(),
+        Mode::Web => unreachable!(),
     };
 
     if args.watch {
-        run_watch(&args, &connection, &table_target, root_path, &ignore_matcher).await
+        run_watch(
+            &args,
+            &connection,
+            &table_target,
+            root_path,
+            &ignore_matcher,
+        )
+        .await
     } else {
-        run_ingest(&args, &connection, &table_target, root_path, &ignore_matcher).await
+        run_ingest(
+            &args,
+            &connection,
+            &table_target,
+            root_path,
+            &ignore_matcher,
+        )
+        .await
     }
 }
