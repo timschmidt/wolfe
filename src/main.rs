@@ -110,6 +110,18 @@ struct Args {
     /// Listen address for --web
     #[arg(long, default_value = "127.0.0.1:8767", requires = "web")]
     listen: SocketAddr,
+
+    /// OpenAI-compatible embeddings endpoint to use for query embeddings
+    #[arg(long, value_name = "URL")]
+    embedding_url: Option<String>,
+
+    /// Model name to send to --embedding-url
+    #[arg(long, default_value = "wolfe-jina")]
+    embedding_model: String,
+
+    /// API key to send as Authorization Bearer and X-Api-Key for --embedding-url
+    #[arg(long, env = "WOLFE_EMBEDDING_API_KEY")]
+    embedding_api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +168,19 @@ struct QueryConfig {
     script: PathBuf,
     task: String,
     device: String,
+    embedding_url: Option<String>,
+    embedding_model: String,
+    embedding_api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingData {
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingResponse {
+    data: Vec<OpenAiEmbeddingData>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -508,6 +533,9 @@ fn query_config_from_args(args: &Args) -> QueryConfig {
         script: args.script.clone(),
         task: args.task.clone(),
         device: args.device.clone(),
+        embedding_url: args.embedding_url.clone(),
+        embedding_model: args.embedding_model.clone(),
+        embedding_api_key: args.embedding_api_key.clone(),
     }
 }
 
@@ -534,9 +562,10 @@ async fn flush_records(
 
     match embedding_dim {
         Some(existing_dim) if *existing_dim != current_dim => {
-            return Err(
-                format!("embedding dimension changed from {existing_dim} to {current_dim}").into(),
-            );
+            return Err(format!(
+                "embedding dimension changed from {existing_dim} to {current_dim}"
+            )
+            .into());
         }
         None => *embedding_dim = Some(current_dim),
         _ => {}
@@ -929,6 +958,31 @@ async fn read_query_embedding(
     config: &QueryConfig,
     query: &str,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    if let Some(embedding_url) = &config.embedding_url {
+        let client = reqwest::Client::new();
+        let mut request = client.post(embedding_url).json(&json!({
+            "model": config.embedding_model,
+            "input": query,
+            "task": config.task,
+        }));
+        if let Some(api_key) = &config.embedding_api_key {
+            request = request.bearer_auth(api_key).header("X-Api-Key", api_key);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("embedding endpoint returned {status}: {body}").into());
+        }
+        let payload: OpenAiEmbeddingResponse = response.json().await?;
+        return payload
+            .data
+            .into_iter()
+            .next()
+            .map(|row| row.embedding)
+            .ok_or_else(|| "embedding endpoint returned no embeddings".into());
+    }
+
     let mut child = Command::new(&config.python)
         .arg(&config.script)
         .arg("--task")

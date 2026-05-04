@@ -145,10 +145,33 @@ cargo run -- --search "error handling in rust" --db wolfe.lance --range 10:20
 cargo run -- --search "error handling in rust" --db wolfe.lance --json
 ```
 
+By default, each CLI search starts the embedding helper long enough to vectorize
+the query. For repeated search, run the Jina embedding model as a persistent
+OpenAI-compatible service:
+
+```bash
+python scripts/jina_embeddings_service.py --listen 127.0.0.1:18092 --device cuda:1
+cargo run -- --search "error handling in rust" --db wolfe.lance \
+  --embedding-url http://127.0.0.1:18092/v1/embeddings \
+  --embedding-model wolfe-jina
+```
+
+The service exposes `GET /health`, `GET /v1/models`, and
+`POST /v1/embeddings`. It keeps the Jina weights loaded between requests, which
+is much faster for browser or iterative CLI searches.
+
 Web search UI:
 
 ```bash
 cargo run -- --web --db wolfe.lance --listen 127.0.0.1:8767
+```
+
+Web mode can use the same persistent embedding service:
+
+```bash
+cargo run -- --web --db wolfe.lance --listen 127.0.0.1:8767 \
+  --embedding-url http://127.0.0.1:18092/v1/embeddings \
+  --embedding-model wolfe-jina
 ```
 
 The web mode serves a local browser UI and JSON endpoints for semantic search
@@ -220,6 +243,9 @@ Similar works: ""
 - `--search TEXT`: Query string to vectorize and search semantically (conflicts with `--path`).
 - `--web`: Run a local web UI for browsing semantic search results.
 - `--listen ADDR`: Listen address for `--web` (default: `127.0.0.1:8767`).
+- `--embedding-url URL`: OpenAI-compatible embedding endpoint for query embeddings.
+- `--embedding-model NAME`: Model name sent to `--embedding-url` (default: `wolfe-jina`).
+- `--embedding-api-key KEY`: API key sent as both Bearer auth and `X-Api-Key`; this can also be set with `WOLFE_EMBEDDING_API_KEY`.
 - `--task TASK`: Embedding task name (default: `retrieval`).
 - `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
 - `--python PATH`: Path to the Python interpreter (default: `python3`).
@@ -235,6 +261,24 @@ Similar works: ""
 - `--ignore-file FILE`: File containing newline-separated ignore entries.
 - `--watch`: Watch for changes and keep the index up to date (requires `--path`).
 - `--download-models`: Pre-download Jina, Whisper, Qwen, and YAMNet into their normal cache directories and exit.
+
+### Persistent Embeddings and GenieHive
+
+Wolfe's persistent embedding service is deliberately OpenAI-compatible so it
+can be called directly or routed through GenieHive. In a GenieHive deployment,
+register the Wolfe service as an embeddings backend with an upstream URL like
+`http://127.0.0.1:18092/v1/embeddings` and an exposed model name such as
+`wolfe-jina`. Wolfe can then point at the GenieHive control endpoint instead:
+
+```bash
+cargo run -- --web --db wolfe.lance \
+  --embedding-url http://127.0.0.1:8800/v1/embeddings \
+  --embedding-model wolfe-jina
+```
+
+If GenieHive requires an API key, set `WOLFE_EMBEDDING_API_KEY` or pass
+`--embedding-api-key`. This keeps model residency, auth, observability, and
+routing policy outside Wolfe while preserving the same search behavior.
 
 Format notes for the CLI:
 
