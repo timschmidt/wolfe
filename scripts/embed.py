@@ -566,7 +566,7 @@ class JinaEmbedder:
             return
         model_kwargs = {}
         if is_cuda_device(self.device):
-            model_kwargs["dtype"] = torch.float16
+            model_kwargs["dtype"] = cuda_jina_dtype(self.device)
         model = AutoModel.from_pretrained(
             JINA_MODEL_ID,
             trust_remote_code=True,
@@ -607,12 +607,12 @@ class JinaEmbedder:
             torch.cuda.empty_cache()
 
 
-def cuda_autocast_dtype(device: str):
+def cuda_jina_dtype(device: str):
     if not is_cuda_device(device):
         return torch.float32
     capability = torch.cuda.get_device_capability(cuda_device_index(device))
     if capability[0] < 8:
-        return torch.float16
+        return torch.float32
     return torch.bfloat16
 
 
@@ -620,7 +620,7 @@ def patch_jina_batch_autocast(model, device: str) -> None:
     if not is_cuda_device(device):
         return
 
-    autocast_dtype = cuda_autocast_dtype(device)
+    autocast_dtype = cuda_jina_dtype(device)
     if autocast_dtype == torch.bfloat16:
         return
 
@@ -654,10 +654,15 @@ def patch_jina_batch_autocast(model, device: str) -> None:
         for batch in tqdm(dataloader, desc=desc, disable=self.verbosity == 0):
             with torch.no_grad():
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                with torch.autocast(
-                    device_type=torch.device(self.device).type,
-                    dtype=autocast_dtype,
-                ):
+                autocast_context = (
+                    contextlib.nullcontext()
+                    if autocast_dtype == torch.float32
+                    else torch.autocast(
+                        device_type=torch.device(self.device).type,
+                        dtype=autocast_dtype,
+                    )
+                )
+                with autocast_context:
                     embeddings = self(**batch, task_label=task_label)
                     if not return_multivector:
                         embeddings = embeddings.single_vec_emb
