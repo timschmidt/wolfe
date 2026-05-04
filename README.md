@@ -167,6 +167,7 @@ To force a device explicitly:
 
 ```bash
 cargo run -- --path /path/to/input-or-directory --device cuda
+cargo run -- --path /path/to/input-or-directory --device cuda:1
 ```
 
 CAD / 3D ingest example:
@@ -222,7 +223,7 @@ Similar works: ""
 - `--task TASK`: Embedding task name (default: `retrieval`).
 - `--db PATH`: Path to the Lance table directory (default: `wolfe.lance`).
 - `--python PATH`: Path to the Python interpreter (default: `python3`).
-- `--device DEVICE`: Execution device (`auto`, `cpu`, `cuda`, `mps`) (default: `auto`).
+- `--device DEVICE`: Execution device (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`) (default: `auto`).
 - `--script PATH`: Path to the embedding helper script (default: `scripts/embed.py`).
 - `--limit N`: Maximum number of search results to return (default: `10`).
 - `--range START:END`: Return a subset of search results (0-based, end-exclusive).

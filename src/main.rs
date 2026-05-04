@@ -55,7 +55,7 @@ struct Args {
     #[arg(long, default_value = "python3")]
     python: String,
 
-    /// Execution device: auto, cpu, cuda, or mps
+    /// Execution device: auto, cpu, cuda, cuda:N, or mps
     #[arg(long, default_value = "auto")]
     device: String,
 

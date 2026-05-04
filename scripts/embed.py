@@ -434,7 +434,7 @@ def load_whisper_model(device: str):
     if _WHISPER_MODEL is not None and _WHISPER_PROCESSOR is not None:
         return _WHISPER_MODEL, _WHISPER_PROCESSOR
 
-    model_dtype = torch.float16 if device == "cuda" else torch.float32
+    model_dtype = torch.float16 if is_cuda_device(device) else torch.float32
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         WHISPER_MODEL_ID,
         dtype=model_dtype,
@@ -512,8 +512,8 @@ def load_qwen_omni_model(device: str, qwen_max_memory_mb: int | None):
         config.enable_audio_output = False
     max_memory = None
     device_map = "auto"
-    if qwen_max_memory_mb and device == "cuda":
-        max_memory = {0: f"{qwen_max_memory_mb}MB"}
+    if qwen_max_memory_mb and is_cuda_device(device):
+        max_memory = {cuda_device_index(device): f"{qwen_max_memory_mb}MB"}
     with contextlib.redirect_stdout(sys.stderr):
         model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
             QWEN_OMNI_MODEL_ID,
@@ -564,9 +564,13 @@ class JinaEmbedder:
     def load(self) -> None:
         if self.model is not None and self.processor is not None:
             return
+        model_kwargs = {}
+        if is_cuda_device(self.device):
+            model_kwargs["dtype"] = torch.float16
         model = AutoModel.from_pretrained(
             JINA_MODEL_ID,
             trust_remote_code=True,
+            **model_kwargs,
         )
         processor = AutoProcessor.from_pretrained(
             JINA_MODEL_ID,
@@ -2188,6 +2192,16 @@ def build_records_for_file(
     return records
 
 
+def is_cuda_device(device: str) -> bool:
+    return device == "cuda" or device.startswith("cuda:")
+
+
+def cuda_device_index(device: str) -> int:
+    if device == "cuda":
+        return 0
+    return int(device.split(":", 1)[1])
+
+
 def detect_device(requested: str) -> str:
     if requested == "auto":
         if torch.cuda.is_available():
@@ -2196,13 +2210,27 @@ def detect_device(requested: str) -> str:
             return "mps"
         return "cpu"
 
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested, but no CUDA-capable PyTorch device is available")
+    if is_cuda_device(requested):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but no CUDA-capable PyTorch device is available")
+        if ":" in requested:
+            try:
+                requested_index = cuda_device_index(requested)
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid CUDA device: {requested}") from exc
+            if requested_index < 0 or requested_index >= torch.cuda.device_count():
+                raise RuntimeError(
+                    f"CUDA device {requested_index} was requested, but only "
+                    f"{torch.cuda.device_count()} CUDA device(s) are available"
+                )
 
     if requested == "mps":
         mps_backend = getattr(torch.backends, "mps", None)
         if not mps_backend or not mps_backend.is_available():
             raise RuntimeError("MPS was requested, but no MPS-capable PyTorch device is available")
+
+    if requested not in {"cpu", "mps"} and not is_cuda_device(requested):
+        raise RuntimeError(f"Unsupported execution device: {requested}")
 
     return requested
 
@@ -2227,8 +2255,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
-        help="Execution device. Defaults to CUDA, then MPS, then CPU when available.",
+        help="Execution device: auto, cpu, cuda, cuda:N, or mps. Defaults to CUDA, then MPS, then CPU.",
     )
     parser.add_argument("--query-text", help="Query string to embed for semantic search")
     parser.add_argument(
