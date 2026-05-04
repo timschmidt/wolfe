@@ -175,7 +175,7 @@ Archive ingest example:
 cargo run -- --path /path/to/archive-or-directory --db wolfe.lance
 ```
 
-Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`.
+Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`. WordPerfect files (`.wp`, `.wp5`, `.wp6`, `.wpd`) are routed through this path when LibreOffice has writerperfect/libwpd support available.
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
