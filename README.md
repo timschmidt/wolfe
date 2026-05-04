@@ -12,7 +12,7 @@ Search text is passed through Jina Embedding v4 to produce an embedding.  When q
 
 - Text: UTF-8 text files, including common plaintext formats such as `.cfg` `.ics` `.ini` `.jsonl` `.log` `.md` `.rst` `.srt` `.toml` `.vtt` `.yaml` `.yml` and other unknown-but-UTF-8 plaintext files
 - MuPDF-backed paged documents: `.pdf` `.djvu` `.epub` `.ps`
-- LibreOffice-converted documents: `.csv` `.dbf` `.dif` `.doc` `.docm` `.docx` `.dot` `.dotm` `.dotx` `.fodg` `.fodp` `.fods` `.fodt` `.htm` `.html` `.mht` `.mhtml` `.odb` `.odc` `.odf` `.odg` `.odm` `.odp` `.ods` `.odt` `.oth` `.otp` `.ots` `.ott` `.otg` `.otm` `.pot` `.potm` `.potx` `.pps` `.ppsm` `.ppsx` `.ppt` `.pptm` `.pptx` `.rtf` `.sda` `.sdc` `.sdd` `.sdw` `.slk` `.svg` `.sxc` `.sxd` `.sxg` `.sxi` `.sxm` `.sxw` `.tab` `.tsv` `.txt` `.uot` `.uop` `.uos` `.uof` `.vdx` `.vsd` `.vsdx` `.xhtml` `.xls` `.xlsm` `.xlsx` `.xlt` `.xltm` `.xltx` `.xml`
+- LibreOffice-converted documents: `.csv` `.dbf` `.dif` `.doc` `.docm` `.docx` `.dot` `.dotm` `.dotx` `.fodg` `.fodp` `.fods` `.fodt` `.htm` `.html` `.mht` `.mhtml` `.odb` `.odc` `.odf` `.odg` `.odm` `.odp` `.ods` `.odt` `.oth` `.otp` `.ots` `.ott` `.otg` `.otm` `.pot` `.potm` `.potx` `.pps` `.ppsm` `.ppsx` `.ppt` `.pptm` `.pptx` `.rtf` `.sda` `.sdc` `.sdd` `.sdw` `.slk` `.svg` `.sxc` `.sxd` `.sxg` `.sxi` `.sxm` `.sxw` `.tab` `.tsv` `.txt` `.uot` `.uop` `.uos` `.uof` `.vdx` `.vsd` `.vsdx` `.wp`, `.wp4`, `.wp5`, `.wp6`, `.wp7`, `.wpd` `.xhtml` `.xls` `.xlsm` `.xlsx` `.xlt` `.xltm` `.xltx` `.xml` 
 - CAD / 3D through F3D: `.3ds` `.gltf` `.glb` `.obj` `.ply` `.stl` `.vtm` `.vti` `.vtk` `.vtp` `.vtr` `.vts` `.vtu` `.wrl` `.x3d`
 - Images: `.avif` `.bmp` `.gif` `.heic` `.heif` `.jpeg` `.jpg` `.png` `.psd` `.tif` `.tiff` `.webp`
 - Audio: `.aac` `.aif` `.aiff` `.au` `.flac` `.m4a` `.mp3` `.ogg` `.opus` `.wav` `.webm`
@@ -175,7 +175,7 @@ Archive ingest example:
 cargo run -- --path /path/to/archive-or-directory --db wolfe.lance
 ```
 
-Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`. WordPerfect files (`.wp`, `.wp4`, `.wp5`, `.wp6`, `.wp7`, `.wpd`) are routed through this path when LibreOffice has writerperfect/libwpd support available.
+Document ingestion for LibreOffice-supported formats requires `soffice` (LibreOffice) to be available on `PATH`. WordPerfect files are routed through this path when LibreOffice has writerperfect/libwpd support available.
 
 Video ingestion requires `ffmpeg` and `ffprobe` to be available on `PATH`.
 
