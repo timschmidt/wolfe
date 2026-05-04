@@ -36,6 +36,15 @@ import numpy as np
 import scipy.signal
 import soundfile as sf
 import torch
+if not hasattr(torch, "compiler"):
+    class _TorchCompilerCompat:
+        @staticmethod
+        def is_compiling() -> bool:
+            return False
+
+    torch.compiler = _TorchCompilerCompat()
+elif not hasattr(torch.compiler, "is_compiling"):
+    torch.compiler.is_compiling = lambda: False
 try:
     import tensorflow as tf
     import tensorflow_hub as hub
