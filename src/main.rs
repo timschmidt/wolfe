@@ -5,7 +5,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::channel;
-use std::{collections::HashSet, env};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    env,
+};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{
@@ -40,8 +43,16 @@ struct Args {
     path: Option<PathBuf>,
 
     /// Query string to vectorize and search semantically
-    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "download_models"])]
+    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "download_models", "match_context"])]
     search: Option<String>,
+
+    /// Lexical term to find and print merged neighboring text chunks for each source
+    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "search", "download_models", "watch", "web"])]
+    match_context: Option<String>,
+
+    /// Number of chunks before and after each lexical match to include
+    #[arg(long, default_value_t = 1)]
+    context_window: u32,
 
     /// Embedding task name
     #[arg(long, default_value = "retrieval")]
@@ -152,6 +163,7 @@ struct QueryRecord {
 enum Mode<'a> {
     Ingest(&'a Path),
     Search(&'a str),
+    MatchContext(&'a str),
     Web,
 }
 
@@ -213,7 +225,7 @@ struct ContextResponse {
     results: Vec<SearchRow>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SearchRow {
     record_id: String,
     path: String,
@@ -229,6 +241,31 @@ struct SearchRow {
     size_bytes: u64,
     modified_at: String,
     distance: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct MatchContextResponse {
+    term: String,
+    window: u32,
+    sources: Vec<MatchContextSource>,
+}
+
+#[derive(Debug, Serialize)]
+struct MatchContextSource {
+    path: String,
+    file_name: String,
+    extension: String,
+    parent_dir: String,
+    matches: usize,
+    windows: Vec<MatchContextWindow>,
+}
+
+#[derive(Debug, Serialize)]
+struct MatchContextWindow {
+    start_chunk: u32,
+    end_chunk: u32,
+    text: String,
+    chunks: Vec<SearchRow>,
 }
 
 struct TableTarget {
@@ -1180,6 +1217,176 @@ async fn run_search(
     Ok(())
 }
 
+async fn all_text_rows(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<Vec<SearchRow>, Box<dyn std::error::Error>> {
+    let table = open_table(connection, table_name)
+        .await
+        .ok_or("search table does not exist")?;
+    let mut results = table.query().limit(1_000_000).execute().await?;
+    let mut rows = Vec::new();
+
+    while let Some(batch) = results.next().await {
+        let batch = batch?;
+        for index in 0..batch.num_rows() {
+            let row = row_from_batch(&batch, index)?;
+            if row.modality == "text" && !row.snippet.trim().is_empty() {
+                rows.push(row);
+            }
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.chunk.cmp(&right.chunk))
+            .then(left.offset.cmp(&right.offset))
+            .then(left.record_id.cmp(&right.record_id))
+    });
+
+    Ok(rows)
+}
+
+fn merge_chunk_windows(windows: &mut Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    windows.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+
+    for (start, end) in windows.drain(..) {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= last_end.saturating_add(1) {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    merged
+}
+
+fn build_match_context(rows: Vec<SearchRow>, term: &str, window: u32) -> MatchContextResponse {
+    let term_lower = term.to_lowercase();
+    let mut sources: BTreeMap<String, Vec<SearchRow>> = BTreeMap::new();
+
+    for row in rows {
+        sources.entry(row.path.clone()).or_default().push(row);
+    }
+
+    let mut context_sources = Vec::new();
+    for (path, mut source_rows) in sources {
+        source_rows.sort_by(|left, right| {
+            left.chunk
+                .cmp(&right.chunk)
+                .then(left.offset.cmp(&right.offset))
+                .then(left.record_id.cmp(&right.record_id))
+        });
+
+        let matching_chunks: BTreeSet<u32> = source_rows
+            .iter()
+            .filter(|row| row.snippet.to_lowercase().contains(&term_lower))
+            .map(|row| row.chunk)
+            .collect();
+
+        if matching_chunks.is_empty() {
+            continue;
+        }
+
+        let mut raw_windows: Vec<(u32, u32)> = matching_chunks
+            .iter()
+            .map(|chunk| (chunk.saturating_sub(window), chunk.saturating_add(window)))
+            .collect();
+        let merged_windows = merge_chunk_windows(&mut raw_windows);
+
+        let windows = merged_windows
+            .into_iter()
+            .map(|(start_chunk, end_chunk)| {
+                let chunks: Vec<SearchRow> = source_rows
+                    .iter()
+                    .filter(|row| row.chunk >= start_chunk && row.chunk <= end_chunk)
+                    .cloned()
+                    .collect();
+                let text = chunks
+                    .iter()
+                    .map(|row| row.snippet.trim())
+                    .filter(|snippet| !snippet.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                MatchContextWindow {
+                    start_chunk,
+                    end_chunk,
+                    text,
+                    chunks,
+                }
+            })
+            .collect();
+
+        let first = &source_rows[0];
+        context_sources.push(MatchContextSource {
+            path,
+            file_name: first.file_name.clone(),
+            extension: first.extension.clone(),
+            parent_dir: first.parent_dir.clone(),
+            matches: matching_chunks.len(),
+            windows,
+        });
+    }
+
+    MatchContextResponse {
+        term: term.to_string(),
+        window,
+        sources: context_sources,
+    }
+}
+
+fn print_match_context(response: &MatchContextResponse) {
+    println!(
+        "# Match context for {:?} (window: {} chunk{})",
+        response.term,
+        response.window,
+        if response.window == 1 { "" } else { "s" }
+    );
+
+    if response.sources.is_empty() {
+        println!("\nNo matches.");
+        return;
+    }
+
+    for source in &response.sources {
+        println!("\n## {}", source.path);
+        println!("matches: {}", source.matches);
+        for window in &source.windows {
+            println!(
+                "\n### chunks {}-{}\n{}",
+                window.start_chunk, window.end_chunk, window.text
+            );
+        }
+    }
+}
+
+async fn run_match_context(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+    term: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let term = term.trim();
+    if term.is_empty() {
+        return Err("--match-context must not be empty".into());
+    }
+
+    let rows = all_text_rows(connection, &table_target.table_name).await?;
+    let response = build_match_context(rows, term, args.context_window);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        print_match_context(&response);
+    }
+
+    Ok(())
+}
+
 async fn connect_web_state(state: &WebState) -> Result<Connection, String> {
     connect(state.db_root.to_string_lossy().as_ref())
         .execute()
@@ -1630,13 +1837,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let table_target = resolve_table_target(&args.db);
     let ignore_matcher = load_ignore_matcher(&args)?;
-    let mode = match (args.web, args.path.as_deref(), args.search.as_deref()) {
-        (true, None, None) => Mode::Web,
-        (false, Some(path), None) => Mode::Ingest(path),
-        (false, None, Some(query)) => Mode::Search(query),
-        (false, Some(_), Some(_)) => return Err("use either --path or --search, not both".into()),
-        (true, _, _) => return Err("--web cannot be combined with --path or --search".into()),
-        (false, None, None) => return Err("either --path, --search, or --web is required".into()),
+    let mode = match (
+        args.web,
+        args.path.as_deref(),
+        args.search.as_deref(),
+        args.match_context.as_deref(),
+    ) {
+        (true, None, None, None) => Mode::Web,
+        (false, Some(path), None, None) => Mode::Ingest(path),
+        (false, None, Some(query), None) => Mode::Search(query),
+        (false, None, None, Some(term)) => Mode::MatchContext(term),
+        (true, _, _, _) => return Err("--web cannot be combined with other modes".into()),
+        (false, None, None, None) => {
+            return Err("either --path, --search, --match-context, or --web is required".into());
+        }
+        _ => return Err("use exactly one of --path, --search, --match-context, or --web".into()),
     };
 
     if matches!(mode, Mode::Ingest(_)) {
@@ -1655,9 +1870,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_search(&args, &connection, &table_target, query).await;
     }
 
+    if let Mode::MatchContext(term) = mode {
+        return run_match_context(&args, &connection, &table_target, term).await;
+    }
+
     let root_path = match mode {
         Mode::Ingest(path) => path,
         Mode::Search(_) => unreachable!(),
+        Mode::MatchContext(_) => unreachable!(),
         Mode::Web => unreachable!(),
     };
 

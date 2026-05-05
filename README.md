@@ -145,6 +145,15 @@ cargo run -- --search "error handling in rust" --db wolfe.lance --range 10:20
 cargo run -- --search "error handling in rust" --db wolfe.lance --json
 ```
 
+Lexical match context scans indexed text for exact term matches, groups matches
+by source, and prints merged neighboring chunks in source order without
+duplicating overlapping context:
+
+```bash
+cargo run -- --match-context biomorph --context-window 1 --db wolfe.lance
+cargo run -- --match-context biomorph --context-window 1 --db wolfe.lance --json
+```
+
 By default, each CLI search starts the embedding helper long enough to vectorize
 the query. For repeated search, run the Jina embedding model as a persistent
 OpenAI-compatible service:
