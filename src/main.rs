@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::channel;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     env,
@@ -43,7 +44,7 @@ struct Args {
     path: Option<PathBuf>,
 
     /// File containing newline-separated files to embed
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["path", "search", "download_models", "watch", "web", "match_context"])]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["path", "search", "download_models", "watch", "web", "match_context", "enrich_corpus"])]
     path_list: Option<PathBuf>,
 
     /// Query string to vectorize and search semantically
@@ -51,7 +52,7 @@ struct Args {
     search: Option<String>,
 
     /// Lexical term to find and print merged neighboring text chunks for each source
-    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "search", "download_models", "watch", "web"])]
+    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "path_list", "search", "download_models", "watch", "web", "enrich_corpus"])]
     match_context: Option<String>,
 
     /// Number of chunks before and after each lexical match to include
@@ -85,6 +86,28 @@ struct Args {
     /// Return search results as JSON
     #[arg(long)]
     json: bool,
+
+    /// Build per-source enrichment metadata from an existing Wolfe index
+    #[arg(long, conflicts_with_all = ["path", "path_list", "search", "match_context", "download_models", "watch", "web"])]
+    enrich_corpus: bool,
+
+    /// Directory for per-source enrichment sidecar JSON files
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "wolfe-metadata",
+        requires = "enrich_corpus"
+    )]
+    metadata_root: PathBuf,
+
+    /// JSONL catalog path for source enrichment metadata
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "wolfe-metadata/catalog.jsonl",
+        requires = "enrich_corpus"
+    )]
+    metadata_catalog: PathBuf,
 
     /// Range of search results to return, formatted as START:END (0-based, end-exclusive)
     #[arg(long, value_name = "START:END")]
@@ -169,6 +192,7 @@ enum Mode<'a> {
     IngestList(&'a Path),
     Search(&'a str),
     MatchContext(&'a str),
+    EnrichCorpus,
     Web,
 }
 
@@ -271,6 +295,61 @@ struct MatchContextWindow {
     end_chunk: u32,
     text: String,
     chunks: Vec<SearchRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct CorpusEnrichmentSummary {
+    sources: usize,
+    sidecar_root: String,
+    catalog: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceMetadata {
+    schema_version: u32,
+    source_id: String,
+    path: String,
+    file_name: String,
+    extension: String,
+    parent_dir: String,
+    document_type: String,
+    title_guess: Option<String>,
+    collection_path: Vec<String>,
+    source_size_bytes: u64,
+    file_size_bytes: Option<u64>,
+    file_modified_unix: Option<u64>,
+    indexed_modified_at: String,
+    row_count: usize,
+    text_chunk_count: usize,
+    image_chunk_count: usize,
+    other_chunk_count: usize,
+    chunk_count: usize,
+    page_count: Option<u64>,
+    text_char_count: usize,
+    word_count: usize,
+    modalities: BTreeMap<String, usize>,
+    bibtex_candidate: BibtexCandidate,
+    enrichment_run: EnrichmentRunMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct BibtexCandidate {
+    entry_type: String,
+    citation_key: String,
+    title: Option<String>,
+    year: Option<String>,
+    howpublished: String,
+    note: String,
+    confidence: f64,
+    sources: Vec<String>,
+    bibtex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrichmentRunMetadata {
+    tool: String,
+    pass: String,
+    generated_unix: u64,
 }
 
 struct TableTarget {
@@ -1254,7 +1333,7 @@ async fn run_search(
     Ok(())
 }
 
-async fn all_text_rows(
+async fn all_index_rows(
     connection: &Connection,
     table_name: &str,
 ) -> Result<Vec<SearchRow>, Box<dyn std::error::Error>> {
@@ -1267,10 +1346,7 @@ async fn all_text_rows(
     while let Some(batch) = results.next().await {
         let batch = batch?;
         for index in 0..batch.num_rows() {
-            let row = row_from_batch(&batch, index)?;
-            if row.modality == "text" && !row.snippet.trim().is_empty() {
-                rows.push(row);
-            }
+            rows.push(row_from_batch(&batch, index)?);
         }
     }
 
@@ -1283,6 +1359,17 @@ async fn all_text_rows(
     });
 
     Ok(rows)
+}
+
+async fn all_text_rows(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<Vec<SearchRow>, Box<dyn std::error::Error>> {
+    Ok(all_index_rows(connection, table_name)
+        .await?
+        .into_iter()
+        .filter(|row| row.modality == "text" && !row.snippet.trim().is_empty())
+        .collect())
 }
 
 fn merge_chunk_windows(windows: &mut Vec<(u32, u32)>) -> Vec<(u32, u32)> {
@@ -1420,6 +1507,300 @@ async fn run_match_context(
     } else {
         print_match_context(&response);
     }
+
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_mtime(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+}
+
+fn stable_fnv1a_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn safe_sidecar_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn document_type_from_extension(extension: &str) -> &'static str {
+    match extension {
+        ".pdf" | ".djvu" | ".epub" | ".ps" => "paged_document",
+        ".doc" | ".docx" | ".odt" | ".rtf" | ".wp" | ".wp5" | ".wp6" | ".wpd" => "document",
+        ".htm" | ".html" | ".xhtml" => "html_document",
+        ".txt" | ".md" | ".rst" | ".msg" | ".art" | ".lst" => "text_document",
+        ".zip" | ".tar" | ".tgz" | ".tbz2" | ".txz" | ".7z" | ".cbz" | ".cbr" => "archive",
+        ".db3" | ".sqlite" | ".sqlite3" => "database",
+        ".ipynb" => "notebook",
+        _ => "unknown",
+    }
+}
+
+fn title_guess_from_file_name(file_name: &str) -> Option<String> {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(file_name);
+    let mut words = Vec::new();
+    for raw_word in stem.split(|ch: char| {
+        ch == '_' || ch == '-' || ch == '.' || ch == '+' || ch == '(' || ch == ')'
+    }) {
+        let word = raw_word.trim();
+        if word.is_empty() {
+            continue;
+        }
+        words.push(word.to_string());
+    }
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
+}
+
+fn first_year(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len().saturating_sub(3) {
+        let window = &bytes[index..index + 4];
+        if window.iter().all(|byte| byte.is_ascii_digit()) {
+            let year = std::str::from_utf8(window).ok()?;
+            if year.starts_with("18") || year.starts_with("19") || year.starts_with("20") {
+                return Some(year.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn citation_slug(title: &str) -> String {
+    let mut slug = String::new();
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn build_bibtex_candidate(path: &str, file_name: &str, title: Option<&str>) -> BibtexCandidate {
+    let year = first_year(path);
+    let title_value = title.map(|value| value.to_string());
+    let slug = title
+        .map(citation_slug)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "source".to_string());
+    let citation_key = match year.as_deref() {
+        Some(year) => format!("unknown{year}-{slug}"),
+        None => format!("unknown-{slug}"),
+    };
+    let bibtex_title = title_value
+        .as_deref()
+        .unwrap_or(file_name)
+        .replace('{', "\\{")
+        .replace('}', "\\}");
+    let bibtex_year = year
+        .as_ref()
+        .map(|value| format!("  year = {{{value}}},\n"))
+        .unwrap_or_default();
+    let bibtex = format!(
+        "@misc{{{citation_key},\n  title = {{{bibtex_title}}},\n{bibtex_year}  file = {{{path}}},\n  note = {{Wolfe filename-derived candidate; requires verification}}\n}}"
+    );
+
+    BibtexCandidate {
+        entry_type: "misc".to_string(),
+        citation_key,
+        title: title_value,
+        year,
+        howpublished: path.to_string(),
+        note: "filename-derived candidate; requires bibliographic verification".to_string(),
+        confidence: 0.2,
+        sources: vec!["file_name".to_string(), "path".to_string()],
+        bibtex,
+    }
+}
+
+fn collection_path(parent_dir: &str) -> Vec<String> {
+    parent_dir
+        .split(std::path::MAIN_SEPARATOR)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+        .count()
+}
+
+fn build_source_metadata(
+    path: String,
+    mut rows: Vec<SearchRow>,
+    generated_unix: u64,
+) -> SourceMetadata {
+    rows.sort_by(|left, right| {
+        left.chunk
+            .cmp(&right.chunk)
+            .then(left.offset.cmp(&right.offset))
+            .then(left.record_id.cmp(&right.record_id))
+    });
+    let first = &rows[0];
+    let file_metadata = fs::metadata(&path).ok();
+    let file_size_bytes = file_metadata.as_ref().map(|metadata| metadata.len());
+    let file_modified_unix = file_metadata.as_ref().and_then(unix_mtime);
+    let source_size_bytes = file_size_bytes.unwrap_or_else(|| {
+        rows.iter()
+            .map(|row| row.size_bytes)
+            .max()
+            .unwrap_or(first.size_bytes)
+    });
+    let mut modalities = BTreeMap::new();
+    let mut unique_chunks = BTreeSet::new();
+    let mut page_count = None;
+    let mut text_char_count = 0usize;
+    let mut total_word_count = 0usize;
+    let mut text_chunk_count = 0usize;
+    let mut image_chunk_count = 0usize;
+    let mut other_chunk_count = 0usize;
+
+    for row in &rows {
+        *modalities.entry(row.modality.clone()).or_insert(0) += 1;
+        unique_chunks.insert(row.chunk);
+        if row.unit == "page" {
+            page_count = Some(page_count.unwrap_or(0).max(row.display_offset));
+        }
+        match row.modality.as_str() {
+            "text" => {
+                text_chunk_count += 1;
+                text_char_count += row.snippet.chars().count();
+                total_word_count += word_count(&row.snippet);
+            }
+            "image" => image_chunk_count += 1,
+            _ => other_chunk_count += 1,
+        }
+    }
+
+    let title_guess = title_guess_from_file_name(&first.file_name);
+    let bibtex_candidate = build_bibtex_candidate(&path, &first.file_name, title_guess.as_deref());
+    let id_input = format!("{path}\0{source_size_bytes}\0{}", first.modified_at);
+    SourceMetadata {
+        schema_version: 1,
+        source_id: stable_fnv1a_hex(&id_input),
+        path,
+        file_name: first.file_name.clone(),
+        extension: first.extension.clone(),
+        parent_dir: first.parent_dir.clone(),
+        document_type: document_type_from_extension(&first.extension).to_string(),
+        title_guess,
+        collection_path: collection_path(&first.parent_dir),
+        source_size_bytes,
+        file_size_bytes,
+        file_modified_unix,
+        indexed_modified_at: first.modified_at.clone(),
+        row_count: rows.len(),
+        text_chunk_count,
+        image_chunk_count,
+        other_chunk_count,
+        chunk_count: unique_chunks.len(),
+        page_count,
+        text_char_count,
+        word_count: total_word_count,
+        modalities,
+        bibtex_candidate,
+        enrichment_run: EnrichmentRunMetadata {
+            tool: "wolfe".to_string(),
+            pass: "source-metadata-v1".to_string(),
+            generated_unix,
+        },
+    }
+}
+
+fn sidecar_path(metadata_root: &Path, source: &SourceMetadata) -> PathBuf {
+    let prefix = source.source_id.get(0..2).unwrap_or("xx");
+    metadata_root.join(prefix).join(format!(
+        "{}-{}.wolfe-meta.json",
+        source.source_id,
+        safe_sidecar_name(&source.file_name)
+    ))
+}
+
+async fn run_enrich_corpus(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rows = all_index_rows(connection, &table_target.table_name).await?;
+    let generated_unix = unix_now();
+    let mut grouped: BTreeMap<String, Vec<SearchRow>> = BTreeMap::new();
+    for row in rows {
+        grouped.entry(row.path.clone()).or_default().push(row);
+    }
+
+    fs::create_dir_all(&args.metadata_root)?;
+    if let Some(parent) = args.metadata_catalog.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let catalog_file = fs::File::create(&args.metadata_catalog)?;
+    let mut catalog = BufWriter::new(catalog_file);
+
+    let mut source_count = 0usize;
+    for (path, source_rows) in grouped {
+        if source_rows.is_empty() {
+            continue;
+        }
+        let metadata = build_source_metadata(path, source_rows, generated_unix);
+        let target = sidecar_path(&args.metadata_root, &metadata);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let sidecar = fs::File::create(target)?;
+        serde_json::to_writer_pretty(sidecar, &metadata)?;
+        serde_json::to_writer(&mut catalog, &metadata)?;
+        writeln!(catalog)?;
+        source_count += 1;
+    }
+    catalog.flush()?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&CorpusEnrichmentSummary {
+            sources: source_count,
+            sidecar_root: args.metadata_root.to_string_lossy().to_string(),
+            catalog: args.metadata_catalog.to_string_lossy().to_string(),
+        })?
+    );
 
     Ok(())
 }
@@ -1880,22 +2261,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.path_list.as_deref(),
         args.search.as_deref(),
         args.match_context.as_deref(),
+        args.enrich_corpus,
     ) {
-        (true, None, None, None, None) => Mode::Web,
-        (false, Some(path), None, None, None) => Mode::Ingest(path),
-        (false, None, Some(path_list), None, None) => Mode::IngestList(path_list),
-        (false, None, None, Some(query), None) => Mode::Search(query),
-        (false, None, None, None, Some(term)) => Mode::MatchContext(term),
-        (true, _, _, _, _) => return Err("--web cannot be combined with other modes".into()),
-        (false, None, None, None, None) => {
+        (true, None, None, None, None, false) => Mode::Web,
+        (false, Some(path), None, None, None, false) => Mode::Ingest(path),
+        (false, None, Some(path_list), None, None, false) => Mode::IngestList(path_list),
+        (false, None, None, Some(query), None, false) => Mode::Search(query),
+        (false, None, None, None, Some(term), false) => Mode::MatchContext(term),
+        (false, None, None, None, None, true) => Mode::EnrichCorpus,
+        (true, _, _, _, _, _) => return Err("--web cannot be combined with other modes".into()),
+        (false, None, None, None, None, false) => {
             return Err(
-                "either --path, --path-list, --search, --match-context, or --web is required"
+                "either --path, --path-list, --search, --match-context, --enrich-corpus, or --web is required"
                     .into(),
             );
         }
         _ => {
             return Err(
-                "use exactly one of --path, --path-list, --search, --match-context, or --web"
+                "use exactly one of --path, --path-list, --search, --match-context, --enrich-corpus, or --web"
                     .into(),
             );
         }
@@ -1921,6 +2304,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_match_context(&args, &connection, &table_target, term).await;
     }
 
+    if matches!(mode, Mode::EnrichCorpus) {
+        return run_enrich_corpus(&args, &connection, &table_target).await;
+    }
+
     if let Mode::IngestList(path_list) = mode {
         return run_ingest_list(&args, &connection, &table_target, path_list).await;
     }
@@ -1930,6 +2317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::IngestList(_) => unreachable!(),
         Mode::Search(_) => unreachable!(),
         Mode::MatchContext(_) => unreachable!(),
+        Mode::EnrichCorpus => unreachable!(),
         Mode::Web => unreachable!(),
     };
 

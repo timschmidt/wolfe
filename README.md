@@ -160,6 +160,18 @@ cargo run -- --match-context biomorph --context-window 1 --db wolfe.lance
 cargo run -- --match-context biomorph --context-window 1 --db wolfe.lance --json
 ```
 
+Corpus enrichment builds per-source metadata sidecars and a JSONL source catalog
+from an existing Wolfe index. The first enrichment pass derives file/path
+metadata, chunk and page counts, approximate word counts, document type, title
+guess, collection path, and a low-confidence BibTeX candidate for later
+verification:
+
+```bash
+cargo run -- --enrich-corpus --db wolfe.lance \
+  --metadata-root wolfe-metadata \
+  --metadata-catalog wolfe-metadata/catalog.jsonl
+```
+
 By default, each CLI search starts the embedding helper long enough to vectorize
 the query. For repeated search, run the Jina embedding model as a persistent
 OpenAI-compatible service:
