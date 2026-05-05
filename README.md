@@ -165,7 +165,9 @@ from an existing Wolfe index. The first enrichment pass derives file/path
 metadata, chunk and page counts, approximate word counts, document type, title
 guess, collection path, and a low-confidence BibTeX candidate for later
 verification. The reference pass emits deterministic DOI, URL, inline citation,
-and reference-section candidates for later CiteGeist or human review:
+and reference-section candidates for later CiteGeist or human review. The
+concept pass emits deterministic concept and definition candidates from common
+definition, denotation, and naming patterns:
 
 ```bash
 cargo run -- --enrich-corpus --db wolfe.lance \
@@ -175,10 +177,14 @@ cargo run -- --enrich-corpus --db wolfe.lance \
 cargo run -- --enrich-corpus --enrichment-pass references --db wolfe.lance \
   --reference-catalog wolfe-metadata/references.jsonl
 
+cargo run -- --enrich-corpus --enrichment-pass concepts --db wolfe.lance \
+  --concept-catalog wolfe-metadata/concepts.jsonl
+
 cargo run -- --enrich-corpus --enrichment-pass all --db wolfe.lance \
   --metadata-root wolfe-metadata \
   --metadata-catalog wolfe-metadata/catalog.jsonl \
-  --reference-catalog wolfe-metadata/references.jsonl
+  --reference-catalog wolfe-metadata/references.jsonl \
+  --concept-catalog wolfe-metadata/concepts.jsonl
 ```
 
 By default, each CLI search starts the embedding helper long enough to vectorize

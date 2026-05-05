@@ -91,7 +91,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["path", "path_list", "search", "match_context", "download_models", "watch", "web"])]
     enrich_corpus: bool,
 
-    /// Enrichment pass to run: source-metadata, references, or all
+    /// Enrichment pass to run: source-metadata, references, concepts, or all
     #[arg(long, default_value = "source-metadata", requires = "enrich_corpus")]
     enrichment_pass: String,
 
@@ -121,6 +121,15 @@ struct Args {
         requires = "enrich_corpus"
     )]
     reference_catalog: PathBuf,
+
+    /// JSONL catalog path for concept and definition candidates
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "wolfe-metadata/concepts.jsonl",
+        requires = "enrich_corpus"
+    )]
+    concept_catalog: PathBuf,
 
     /// Range of search results to return, formatted as START:END (0-based, end-exclusive)
     #[arg(long, value_name = "START:END")]
@@ -315,9 +324,11 @@ struct CorpusEnrichmentSummary {
     pass: String,
     sources: usize,
     reference_candidates: usize,
+    concept_candidates: usize,
     sidecar_root: String,
     catalog: String,
     reference_catalog: String,
+    concept_catalog: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -386,6 +397,27 @@ struct ReferenceCandidate {
     doi: Option<String>,
     url: Option<String>,
     year: Option<String>,
+    confidence: f64,
+    enrichment_run: EnrichmentRunMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct ConceptCandidate {
+    schema_version: u32,
+    candidate_id: String,
+    source_id: String,
+    path: String,
+    file_name: String,
+    extension: String,
+    parent_dir: String,
+    chunk: u32,
+    offset: u64,
+    display_offset: u64,
+    unit: &'static str,
+    phrase: String,
+    normalized_phrase: String,
+    definition_type: String,
+    evidence_text: String,
     confidence: f64,
     enrichment_run: EnrichmentRunMetadata,
 }
@@ -1865,6 +1897,227 @@ fn reference_candidates_from_row(row: &SearchRow, generated_unix: u64) -> Vec<Re
     candidates
 }
 
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0usize;
+    for (index, ch) in text.char_indices() {
+        if matches!(ch, '.' | '?' | '!') {
+            let end = index + ch.len_utf8();
+            let sentence = text[start..end].trim();
+            if sentence.len() >= 20 {
+                sentences.push(sentence.to_string());
+            }
+            start = end;
+        }
+    }
+    let tail = text[start..].trim();
+    if tail.len() >= 20 {
+        sentences.push(tail.to_string());
+    }
+    sentences
+}
+
+fn normalized_phrase(value: &str) -> String {
+    value
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn trim_concept_phrase(value: &str) -> String {
+    let trimmed = value
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ',' | ';' | ':' | '.' | ')' | '(' | ']' | '[' | '}' | '{' | '"' | '\''
+                )
+        })
+        .to_string();
+    let mut words = trimmed.split_whitespace().collect::<Vec<_>>();
+    while words.len() > 1
+        && words[0].len() > 2
+        && words[0].chars().all(|ch| ch.is_ascii_uppercase())
+    {
+        words.remove(0);
+    }
+    words.join(" ")
+}
+
+fn is_unhelpful_concept_phrase(value: &str) -> bool {
+    let lower = normalized_phrase(value);
+    if lower.len() < 3 {
+        return true;
+    }
+    let words = lower.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() || words.len() > 12 {
+        return true;
+    }
+    matches!(
+        words[0],
+        "a" | "an"
+            | "the"
+            | "i"
+            | "we"
+            | "you"
+            | "he"
+            | "she"
+            | "it"
+            | "they"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "there"
+            | "what"
+            | "which"
+            | "who"
+            | "when"
+            | "where"
+            | "why"
+            | "how"
+    )
+}
+
+fn phrase_before_marker(sentence: &str, marker: &str) -> Option<String> {
+    let index = sentence.find(marker)?;
+    let before = sentence[..index].trim();
+    let phrase = before
+        .rsplit_once(|ch: char| matches!(ch, '.' | ';' | ':' | '(' | ')'))
+        .map(|(_, right)| right)
+        .unwrap_or(before);
+    let phrase = trim_concept_phrase(phrase);
+    let word_count = phrase.split_whitespace().count();
+    if (1..=12).contains(&word_count)
+        && phrase.chars().any(|ch| ch.is_alphabetic())
+        && !is_unhelpful_concept_phrase(&phrase)
+    {
+        Some(phrase)
+    } else {
+        None
+    }
+}
+
+fn phrase_after_marker(sentence: &str, marker: &str) -> Option<String> {
+    let index = sentence.find(marker)?;
+    let after = sentence[index + marker.len()..].trim();
+    let mut phrase = after
+        .split_once(|ch: char| matches!(ch, ',' | ';' | ':' | '(' | ')'))
+        .map(|(left, _)| left)
+        .unwrap_or(after);
+    for delimiter in [" is ", " are ", " was ", " were ", " by ", " that "] {
+        if let Some((left, _)) = phrase.split_once(delimiter) {
+            phrase = left;
+        }
+    }
+    let phrase = trim_concept_phrase(phrase);
+    let word_count = phrase.split_whitespace().count();
+    if (1..=12).contains(&word_count)
+        && phrase.chars().any(|ch| ch.is_alphabetic())
+        && !is_unhelpful_concept_phrase(&phrase)
+    {
+        Some(phrase)
+    } else {
+        None
+    }
+}
+
+fn build_concept_candidate(
+    row: &SearchRow,
+    phrase: String,
+    definition_type: &str,
+    evidence_text: String,
+    confidence: f64,
+    generated_unix: u64,
+) -> ConceptCandidate {
+    let source_input = format!("{}\0{}\0{}", row.path, row.size_bytes, row.modified_at);
+    let source_id = stable_fnv1a_hex(&source_input);
+    let normalized = normalized_phrase(&phrase);
+    let candidate_input = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        row.path, row.chunk, row.offset, definition_type, normalized
+    );
+    ConceptCandidate {
+        schema_version: 1,
+        candidate_id: stable_fnv1a_hex(&candidate_input),
+        source_id,
+        path: row.path.clone(),
+        file_name: row.file_name.clone(),
+        extension: row.extension.clone(),
+        parent_dir: row.parent_dir.clone(),
+        chunk: row.chunk,
+        offset: row.offset,
+        display_offset: row.display_offset,
+        unit: row.unit,
+        phrase,
+        normalized_phrase: normalized,
+        definition_type: definition_type.to_string(),
+        evidence_text,
+        confidence,
+        enrichment_run: EnrichmentRunMetadata {
+            tool: "wolfe".to_string(),
+            pass: "concepts-v1".to_string(),
+            generated_unix,
+        },
+    }
+}
+
+fn concept_candidates_from_row(row: &SearchRow, generated_unix: u64) -> Vec<ConceptCandidate> {
+    if row.modality != "text" || row.snippet.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for sentence in split_sentences(&row.snippet) {
+        let lower = sentence.to_lowercase();
+        let patterns = [
+            (" is defined as ", "explicit_definition", 0.78),
+            (" are defined as ", "explicit_definition", 0.78),
+            (" means ", "denotation", 0.72),
+            (" refers to ", "denotation", 0.72),
+            (" is called ", "naming", 0.64),
+            (" are called ", "naming", 0.64),
+            (" is known as ", "naming", 0.64),
+            (" are known as ", "naming", 0.64),
+            (" is a ", "description", 0.58),
+            (" is an ", "description", 0.58),
+        ];
+        for (marker, definition_type, confidence) in patterns {
+            if !lower.contains(marker) {
+                continue;
+            }
+            if let Some(phrase) = phrase_before_marker(&sentence, marker) {
+                candidates.push(build_concept_candidate(
+                    row,
+                    phrase,
+                    definition_type,
+                    excerpt_chars(&sentence, 900),
+                    confidence,
+                    generated_unix,
+                ));
+            }
+        }
+        for marker in ["called ", "known as "] {
+            if !lower.contains(marker) {
+                continue;
+            }
+            if let Some(phrase) = phrase_after_marker(&sentence, marker) {
+                candidates.push(build_concept_candidate(
+                    row,
+                    phrase,
+                    "naming",
+                    excerpt_chars(&sentence, 900),
+                    0.5,
+                    generated_unix,
+                ));
+            }
+        }
+    }
+
+    candidates
+}
+
 fn build_bibtex_candidate(path: &str, file_name: &str, title: Option<&str>) -> BibtexCandidate {
     let year = first_year(path);
     let title_value = title.map(|value| value.to_string());
@@ -2017,12 +2270,16 @@ async fn run_enrich_corpus(
     let run_source_metadata =
         args.enrichment_pass == "source-metadata" || args.enrichment_pass == "all";
     let run_references = args.enrichment_pass == "references" || args.enrichment_pass == "all";
-    if !run_source_metadata && !run_references {
-        return Err("invalid --enrichment-pass: use source-metadata, references, or all".into());
+    let run_concepts = args.enrichment_pass == "concepts" || args.enrichment_pass == "all";
+    if !run_source_metadata && !run_references && !run_concepts {
+        return Err(
+            "invalid --enrichment-pass: use source-metadata, references, concepts, or all".into(),
+        );
     }
 
     let mut source_count = 0usize;
     let mut reference_count = 0usize;
+    let mut concept_count = 0usize;
 
     if run_source_metadata {
         source_count = write_source_metadata(args, rows.clone(), generated_unix)?;
@@ -2032,15 +2289,21 @@ async fn run_enrich_corpus(
         reference_count = write_reference_candidates(args, &rows, generated_unix)?;
     }
 
+    if run_concepts {
+        concept_count = write_concept_candidates(args, &rows, generated_unix)?;
+    }
+
     println!(
         "{}",
         serde_json::to_string_pretty(&CorpusEnrichmentSummary {
             pass: args.enrichment_pass.clone(),
             sources: source_count,
             reference_candidates: reference_count,
+            concept_candidates: concept_count,
             sidecar_root: args.metadata_root.to_string_lossy().to_string(),
             catalog: args.metadata_catalog.to_string_lossy().to_string(),
             reference_catalog: args.reference_catalog.to_string_lossy().to_string(),
+            concept_catalog: args.concept_catalog.to_string_lossy().to_string(),
         })?
     );
 
@@ -2104,6 +2367,35 @@ fn write_reference_candidates(
 
     for row in rows {
         for candidate in reference_candidates_from_row(row, generated_unix) {
+            if !seen.insert(candidate.candidate_id.clone()) {
+                continue;
+            }
+            serde_json::to_writer(&mut writer, &candidate)?;
+            writeln!(writer)?;
+            count += 1;
+        }
+    }
+    writer.flush()?;
+    Ok(count)
+}
+
+fn write_concept_candidates(
+    args: &Args,
+    rows: &[SearchRow],
+    generated_unix: u64,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if let Some(parent) = args.concept_catalog.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let concept_file = fs::File::create(&args.concept_catalog)?;
+    let mut writer = BufWriter::new(concept_file);
+    let mut seen = BTreeSet::new();
+    let mut count = 0usize;
+
+    for row in rows {
+        for candidate in concept_candidates_from_row(row, generated_unix) {
             if !seen.insert(candidate.candidate_id.clone()) {
                 continue;
             }
