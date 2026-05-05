@@ -40,6 +40,8 @@ def create_app(device: str, default_task: str) -> FastAPI:
             embedding = model.encode_text(texts=text, task=task)
         if hasattr(embedding, "detach"):
             embedding = embedding.detach().cpu().tolist()
+        if embed.torch.cuda.is_available():
+            embed.torch.cuda.empty_cache()
         return embedding
 
     @app.get("/health")
@@ -80,6 +82,8 @@ def create_app(device: str, default_task: str) -> FastAPI:
         try:
             vectors = [encode_one(value, task) for value in values]
         except Exception as exc:
+            if embed.torch.cuda.is_available():
+                embed.torch.cuda.empty_cache()
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         prompt_tokens = sum(len(value.split()) for value in values)

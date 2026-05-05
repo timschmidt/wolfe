@@ -846,6 +846,20 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg(&args.device)
         .arg("--document-extensions")
         .arg(document_extensions_arg())
+        .args(
+            args.embedding_url
+                .as_ref()
+                .map(|value| vec!["--embedding-url".to_string(), value.to_string()])
+                .unwrap_or_default(),
+        )
+        .arg("--embedding-model")
+        .arg(&args.embedding_model)
+        .args(
+            args.embedding_api_key
+                .as_ref()
+                .map(|value| vec!["--embedding-api-key".to_string(), value.to_string()])
+                .unwrap_or_default(),
+        )
         .args(if args.translate {
             vec!["--translate"]
         } else {

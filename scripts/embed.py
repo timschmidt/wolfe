@@ -12,6 +12,8 @@ import subprocess
 import contextlib
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 import tarfile
 try:
@@ -85,6 +87,21 @@ AUDIO_EXTENSIONS = {
     ".wav",
     ".webm",
 }
+TEXT_EXTENSIONS = {
+    ".cfg",
+    ".ics",
+    ".ini",
+    ".jsonl",
+    ".log",
+    ".md",
+    ".rst",
+    ".srt",
+    ".toml",
+    ".txt",
+    ".vtt",
+    ".yaml",
+    ".yml",
+}
 VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",
@@ -139,6 +156,7 @@ ARCHIVE_EXTENSIONS = {
     ".zip",
 }
 TOKEN_CHUNK_LIMIT = 20000
+REMOTE_TOKEN_CHUNK_LIMIT = 1024
 MIN_TOKEN_CHUNK_LIMIT = 1000
 YAMNET_SAMPLE_RATE = 16000
 YAMNET_TOP_CLASSES = 10
@@ -249,6 +267,10 @@ DOCUMENT_EXTENSIONS: set[str] = set()
 
 def is_document_file(path: Path) -> bool:
     return path.suffix.lower() in DOCUMENT_EXTENSIONS
+
+
+def is_text_file(path: Path) -> bool:
+    return path.suffix.lower() in TEXT_EXTENSIONS
 
 
 def has_video_stream(path: Path) -> bool:
@@ -565,10 +587,29 @@ def unload_qwen_omni_model() -> None:
 
 
 class JinaEmbedder:
-    def __init__(self, device: str) -> None:
+    def __init__(
+        self,
+        device: str,
+        embedding_url: str | None = None,
+        embedding_model: str = "wolfe-jina",
+        embedding_api_key: str | None = None,
+    ) -> None:
         self.device = device
+        self.embedding_url = embedding_url
+        self.embedding_model = embedding_model
+        self.embedding_api_key = embedding_api_key
         self.model = None
         self.processor = None
+
+    def load_processor(self) -> None:
+        if self.processor is not None:
+            return
+        self.processor = AutoProcessor.from_pretrained(
+            JINA_MODEL_ID,
+            trust_remote_code=True,
+            use_fast=True,
+            fix_mistral_regex=True,
+        )
 
     def load(self) -> None:
         if self.model is not None and self.processor is not None:
@@ -581,12 +622,10 @@ class JinaEmbedder:
             trust_remote_code=True,
             **model_kwargs,
         )
-        processor = AutoProcessor.from_pretrained(
-            JINA_MODEL_ID,
-            trust_remote_code=True,
-            use_fast=True,
-            fix_mistral_regex=True,
-        )
+        self.load_processor()
+        processor = self.processor
+        if processor is None:
+            raise RuntimeError("embedding processor failed to load")
         model.processor = processor
         model.to(self.device)
         patch_jina_batch_autocast(model, self.device)
@@ -985,13 +1024,37 @@ def encode_text_chunks(
     start_char: int = 0,
     low_memory: bool = False,
 ) -> list[tuple[int, str, list[float]]]:
+    processor = embedder.processor
+    if processor is None:
+        embedder.load_processor()
+        processor = embedder.processor
+    if processor is None:
+        raise RuntimeError("embedding processor failed to load")
+    chunk_limit = min(max_tokens, REMOTE_TOKEN_CHUNK_LIMIT) if embedder.embedding_url else max_tokens
+    text_chunks = chunk_text(processor.tokenizer, text, max_tokens=chunk_limit, start_char=start_char)
+    embeddings: list[tuple[int, str, list[float]]] = []
+
+    if embedder.embedding_url:
+        vectors = request_remote_embeddings(
+            embedder.embedding_url,
+            embedder.embedding_model,
+            embedder.embedding_api_key,
+            [chunk_text_value for chunk_text_value, _chunk_start in text_chunks],
+            task,
+        )
+        if len(vectors) != len(text_chunks):
+            raise RuntimeError(
+                f"embedding endpoint returned {len(vectors)} embeddings for {len(text_chunks)} chunks"
+            )
+        return [
+            (chunk_start, chunk_text_value, vector)
+            for (chunk_text_value, chunk_start), vector in zip(text_chunks, vectors)
+        ]
+
     ensure_jina_loaded(embedder, low_memory)
     model = embedder.model
-    processor = embedder.processor
-    if model is None or processor is None:
+    if model is None:
         raise RuntimeError("embedding model failed to load")
-    text_chunks = chunk_text(processor.tokenizer, text, max_tokens=max_tokens, start_char=start_char)
-    embeddings: list[tuple[int, str, list[float]]] = []
 
     for chunk_text_value, chunk_start in text_chunks:
         try:
@@ -1027,6 +1090,45 @@ def encode_text_chunks(
             torch.cuda.empty_cache()
 
     return embeddings
+
+
+def request_remote_embeddings(
+    embedding_url: str,
+    embedding_model: str,
+    embedding_api_key: str | None,
+    texts: list[str],
+    task: str,
+) -> list[list[float]]:
+    if not texts:
+        return []
+
+    payload = json.dumps(
+        {
+            "model": embedding_model,
+            "input": texts,
+            "task": task,
+        }
+    ).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if embedding_api_key:
+        headers["Authorization"] = f"Bearer {embedding_api_key}"
+        headers["X-Api-Key"] = embedding_api_key
+
+    request = urllib.request.Request(embedding_url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"embedding endpoint returned HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"embedding endpoint request failed: {exc.reason}") from exc
+
+    data = json.loads(body)
+    rows = sorted(data.get("data", []), key=lambda row: row.get("index", 0))
+    return [row["embedding"] for row in rows]
 
 
 def build_text_records(
@@ -1095,6 +1197,9 @@ def build_pdf_records(
             )
             records.extend(offset_record_chunks(page_records, len(records)))
 
+    if embedder.embedding_url:
+        return records
+
     for page_index, page_image in page_images:
         ensure_jina_loaded(embedder, low_memory)
         model = embedder.model
@@ -1132,6 +1237,9 @@ def build_pdf_records_from_source(
                 low_memory=low_memory,
             )
             records.extend(offset_record_chunks(page_records, len(records)))
+
+    if embedder.embedding_url:
+        return records
 
     for page_index, page_image in page_images:
         ensure_jina_loaded(embedder, low_memory)
@@ -2187,6 +2295,17 @@ def build_records_for_file(
             task,
             low_memory,
         )
+    elif is_text_file(file_path):
+        text = read_text_file(file_path)
+        if text is None:
+            raise RuntimeError("unsupported_text_encoding")
+        records = build_text_records(
+            embedder,
+            file_path,
+            text,
+            task,
+            low_memory=low_memory,
+        )
     elif is_document_file(file_path):
         pdf_path = None
         tmpdir = None
@@ -2389,6 +2508,20 @@ def parse_args() -> argparse.Namespace:
         "--document-extensions",
         help="Comma-separated LibreOffice document extensions passed by the Rust CLI for file ingest",
     )
+    parser.add_argument(
+        "--embedding-url",
+        help="OpenAI-compatible embedding endpoint for text chunk embeddings",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default="wolfe-jina",
+        help="Model name to send to --embedding-url",
+    )
+    parser.add_argument(
+        "--embedding-api-key",
+        default=os.environ.get("WOLFE_EMBEDDING_API_KEY"),
+        help="API key to send as Authorization Bearer and X-Api-Key for --embedding-url",
+    )
     return parser.parse_args()
 
 
@@ -2407,18 +2540,33 @@ def main() -> None:
     if args.low_memory:
         disable_tf_gpu()
     device = detect_device(args.device)
-    embedder = JinaEmbedder(device)
+    embedder = JinaEmbedder(
+        device,
+        embedding_url=args.embedding_url,
+        embedding_model=args.embedding_model,
+        embedding_api_key=args.embedding_api_key,
+    )
 
     if args.query_text is not None:
-        ensure_jina_loaded(embedder, args.low_memory)
-        model = embedder.model
-        if model is None:
-            raise RuntimeError("embedding model failed to load")
-        with torch.inference_mode():
-            embedding = model.encode_text(texts=args.query_text, task=args.task)
+        if args.embedding_url:
+            embeddings = request_remote_embeddings(
+                args.embedding_url,
+                args.embedding_model,
+                args.embedding_api_key,
+                [args.query_text],
+                args.task,
+            )
+            embedding = embeddings[0]
+        else:
+            ensure_jina_loaded(embedder, args.low_memory)
+            model = embedder.model
+            if model is None:
+                raise RuntimeError("embedding model failed to load")
+            with torch.inference_mode():
+                embedding = model.encode_text(texts=args.query_text, task=args.task)
 
-        if hasattr(embedding, "detach"):
-            embedding = embedding.detach().cpu().tolist()
+            if hasattr(embedding, "detach"):
+                embedding = embedding.detach().cpu().tolist()
 
         emit_json({"status": "query", "embedding": embedding})
         return
