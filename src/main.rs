@@ -91,6 +91,10 @@ struct Args {
     #[arg(long, conflicts_with_all = ["path", "path_list", "search", "match_context", "download_models", "watch", "web"])]
     enrich_corpus: bool,
 
+    /// Enrichment pass to run: source-metadata, references, or all
+    #[arg(long, default_value = "source-metadata", requires = "enrich_corpus")]
+    enrichment_pass: String,
+
     /// Directory for per-source enrichment sidecar JSON files
     #[arg(
         long,
@@ -108,6 +112,15 @@ struct Args {
         requires = "enrich_corpus"
     )]
     metadata_catalog: PathBuf,
+
+    /// JSONL catalog path for reference and citation candidates
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "wolfe-metadata/references.jsonl",
+        requires = "enrich_corpus"
+    )]
+    reference_catalog: PathBuf,
 
     /// Range of search results to return, formatted as START:END (0-based, end-exclusive)
     #[arg(long, value_name = "START:END")]
@@ -299,9 +312,12 @@ struct MatchContextWindow {
 
 #[derive(Debug, Serialize)]
 struct CorpusEnrichmentSummary {
+    pass: String,
     sources: usize,
+    reference_candidates: usize,
     sidecar_root: String,
     catalog: String,
+    reference_catalog: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,6 +366,28 @@ struct EnrichmentRunMetadata {
     tool: String,
     pass: String,
     generated_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReferenceCandidate {
+    schema_version: u32,
+    candidate_id: String,
+    source_id: String,
+    path: String,
+    file_name: String,
+    extension: String,
+    parent_dir: String,
+    chunk: u32,
+    offset: u64,
+    display_offset: u64,
+    unit: &'static str,
+    kind: String,
+    text: String,
+    doi: Option<String>,
+    url: Option<String>,
+    year: Option<String>,
+    confidence: f64,
+    enrichment_run: EnrichmentRunMetadata,
 }
 
 struct TableTarget {
@@ -1597,6 +1635,22 @@ fn first_year(value: &str) -> Option<String> {
     None
 }
 
+fn all_years(value: &str) -> Vec<String> {
+    let mut years = BTreeSet::new();
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len().saturating_sub(3) {
+        let window = &bytes[index..index + 4];
+        if window.iter().all(|byte| byte.is_ascii_digit()) {
+            if let Ok(year) = std::str::from_utf8(window) {
+                if year.starts_with("18") || year.starts_with("19") || year.starts_with("20") {
+                    years.insert(year.to_string());
+                }
+            }
+        }
+    }
+    years.into_iter().collect()
+}
+
 fn citation_slug(title: &str) -> String {
     let mut slug = String::new();
     for ch in title.chars() {
@@ -1610,6 +1664,205 @@ fn citation_slug(title: &str) -> String {
         }
     }
     slug.trim_matches('-').to_string()
+}
+
+fn trim_candidate_token(value: &str) -> String {
+    value
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ',' | ';' | ':' | '.' | ')' | '(' | ']' | '[' | '}' | '{' | '"' | '\''
+                )
+        })
+        .to_string()
+}
+
+fn extract_doi_tokens(text: &str) -> Vec<String> {
+    let mut dois = BTreeSet::new();
+    for token in text.split_whitespace() {
+        let normalized = token.trim_start_matches("doi:").trim_start_matches("DOI:");
+        if let Some(index) = normalized.find("10.") {
+            let candidate = trim_candidate_token(&normalized[index..]);
+            if candidate.len() >= 7 && candidate.contains('/') {
+                dois.insert(candidate);
+            }
+        }
+    }
+    dois.into_iter().collect()
+}
+
+fn extract_url_tokens(text: &str) -> Vec<String> {
+    let mut urls = BTreeSet::new();
+    for token in text.split_whitespace() {
+        if token.starts_with("http://") || token.starts_with("https://") {
+            let candidate = trim_candidate_token(token);
+            if candidate.len() > "http://x".len() {
+                urls.insert(candidate);
+            }
+        }
+    }
+    urls.into_iter().collect()
+}
+
+fn excerpt_chars(text: &str, max_chars: usize) -> String {
+    let mut value: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        value.push_str("...");
+    }
+    value
+}
+
+fn previous_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn citation_parenthetical_candidates(text: &str) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    let bytes = text.as_bytes();
+    for index in 0..bytes.len().saturating_sub(3) {
+        let window = &bytes[index..index + 4];
+        if !window.iter().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(year) = std::str::from_utf8(window) else {
+            continue;
+        };
+        if !(year.starts_with("18") || year.starts_with("19") || year.starts_with("20")) {
+            continue;
+        }
+        let search_start = previous_char_boundary(text, index.saturating_sub(120));
+        let Some(open_relative) = text[search_start..index].rfind('(') else {
+            continue;
+        };
+        let open = search_start + open_relative;
+        let search_end = previous_char_boundary(text, (index + 80).min(text.len()));
+        let Some(close_relative) = text[index..search_end].find(')') else {
+            continue;
+        };
+        let close = index + close_relative + 1;
+        let candidate = text[open..close].trim();
+        if candidate.len() >= 8
+            && candidate.len() <= 220
+            && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+        {
+            candidates.insert(candidate.to_string());
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+fn looks_like_reference_section(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("references")
+        || lower.contains("bibliography")
+        || lower.contains("literature cited")
+        || lower.contains("works cited")
+}
+
+fn build_reference_candidate(
+    row: &SearchRow,
+    kind: &str,
+    text: String,
+    doi: Option<String>,
+    url: Option<String>,
+    year: Option<String>,
+    confidence: f64,
+    generated_unix: u64,
+) -> ReferenceCandidate {
+    let source_input = format!("{}\0{}\0{}", row.path, row.size_bytes, row.modified_at);
+    let source_id = stable_fnv1a_hex(&source_input);
+    let candidate_input = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        row.path, row.chunk, row.offset, kind, text
+    );
+    ReferenceCandidate {
+        schema_version: 1,
+        candidate_id: stable_fnv1a_hex(&candidate_input),
+        source_id,
+        path: row.path.clone(),
+        file_name: row.file_name.clone(),
+        extension: row.extension.clone(),
+        parent_dir: row.parent_dir.clone(),
+        chunk: row.chunk,
+        offset: row.offset,
+        display_offset: row.display_offset,
+        unit: row.unit,
+        kind: kind.to_string(),
+        text,
+        doi,
+        url,
+        year,
+        confidence,
+        enrichment_run: EnrichmentRunMetadata {
+            tool: "wolfe".to_string(),
+            pass: "references-v1".to_string(),
+            generated_unix,
+        },
+    }
+}
+
+fn reference_candidates_from_row(row: &SearchRow, generated_unix: u64) -> Vec<ReferenceCandidate> {
+    if row.modality != "text" || row.snippet.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let years = all_years(&row.snippet);
+    for doi in extract_doi_tokens(&row.snippet) {
+        candidates.push(build_reference_candidate(
+            row,
+            "doi",
+            doi.clone(),
+            Some(doi),
+            None,
+            years.first().cloned(),
+            0.9,
+            generated_unix,
+        ));
+    }
+    for url in extract_url_tokens(&row.snippet) {
+        candidates.push(build_reference_candidate(
+            row,
+            "url",
+            url.clone(),
+            None,
+            Some(url),
+            years.first().cloned(),
+            0.75,
+            generated_unix,
+        ));
+    }
+    for citation in citation_parenthetical_candidates(&row.snippet) {
+        candidates.push(build_reference_candidate(
+            row,
+            "inline_citation",
+            citation.clone(),
+            None,
+            None,
+            first_year(&citation),
+            0.55,
+            generated_unix,
+        ));
+    }
+    if looks_like_reference_section(&row.snippet) {
+        candidates.push(build_reference_candidate(
+            row,
+            "reference_section",
+            excerpt_chars(row.snippet.trim(), 1200),
+            None,
+            None,
+            years.first().cloned(),
+            0.45,
+            generated_unix,
+        ));
+    }
+
+    candidates
 }
 
 fn build_bibtex_candidate(path: &str, file_name: &str, title: Option<&str>) -> BibtexCandidate {
@@ -1761,6 +2014,44 @@ async fn run_enrich_corpus(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rows = all_index_rows(connection, &table_target.table_name).await?;
     let generated_unix = unix_now();
+    let run_source_metadata =
+        args.enrichment_pass == "source-metadata" || args.enrichment_pass == "all";
+    let run_references = args.enrichment_pass == "references" || args.enrichment_pass == "all";
+    if !run_source_metadata && !run_references {
+        return Err("invalid --enrichment-pass: use source-metadata, references, or all".into());
+    }
+
+    let mut source_count = 0usize;
+    let mut reference_count = 0usize;
+
+    if run_source_metadata {
+        source_count = write_source_metadata(args, rows.clone(), generated_unix)?;
+    }
+
+    if run_references {
+        reference_count = write_reference_candidates(args, &rows, generated_unix)?;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&CorpusEnrichmentSummary {
+            pass: args.enrichment_pass.clone(),
+            sources: source_count,
+            reference_candidates: reference_count,
+            sidecar_root: args.metadata_root.to_string_lossy().to_string(),
+            catalog: args.metadata_catalog.to_string_lossy().to_string(),
+            reference_catalog: args.reference_catalog.to_string_lossy().to_string(),
+        })?
+    );
+
+    Ok(())
+}
+
+fn write_source_metadata(
+    args: &Args,
+    rows: Vec<SearchRow>,
+    generated_unix: u64,
+) -> Result<usize, Box<dyn std::error::Error>> {
     let mut grouped: BTreeMap<String, Vec<SearchRow>> = BTreeMap::new();
     for row in rows {
         grouped.entry(row.path.clone()).or_default().push(row);
@@ -1775,7 +2066,7 @@ async fn run_enrich_corpus(
     let catalog_file = fs::File::create(&args.metadata_catalog)?;
     let mut catalog = BufWriter::new(catalog_file);
 
-    let mut source_count = 0usize;
+    let mut source_count = 0;
     for (path, source_rows) in grouped {
         if source_rows.is_empty() {
             continue;
@@ -1793,16 +2084,36 @@ async fn run_enrich_corpus(
     }
     catalog.flush()?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&CorpusEnrichmentSummary {
-            sources: source_count,
-            sidecar_root: args.metadata_root.to_string_lossy().to_string(),
-            catalog: args.metadata_catalog.to_string_lossy().to_string(),
-        })?
-    );
+    Ok(source_count)
+}
 
-    Ok(())
+fn write_reference_candidates(
+    args: &Args,
+    rows: &[SearchRow],
+    generated_unix: u64,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if let Some(parent) = args.reference_catalog.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let reference_file = fs::File::create(&args.reference_catalog)?;
+    let mut writer = BufWriter::new(reference_file);
+    let mut seen = BTreeSet::new();
+    let mut count = 0usize;
+
+    for row in rows {
+        for candidate in reference_candidates_from_row(row, generated_unix) {
+            if !seen.insert(candidate.candidate_id.clone()) {
+                continue;
+            }
+            serde_json::to_writer(&mut writer, &candidate)?;
+            writeln!(writer)?;
+            count += 1;
+        }
+    }
+    writer.flush()?;
+    Ok(count)
 }
 
 async fn connect_web_state(state: &WebState) -> Result<Connection, String> {
