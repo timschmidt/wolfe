@@ -129,6 +129,7 @@ cargo run -- --path /path/to/input-or-directory --translate --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --low-memory --db wolfe.lance
 cargo run -- --path /path/to/input-or-directory --low-memory --qwen-max-memory 6000 --db wolfe.lance
+cargo run -- --path-list /path/to/files.txt --low-memory --db wolfe.lance
 ```
 
 Pre-download model caches:

@@ -42,8 +42,12 @@ struct Args {
     )]
     path: Option<PathBuf>,
 
+    /// File containing newline-separated files to embed
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["path", "search", "download_models", "watch", "web", "match_context"])]
+    path_list: Option<PathBuf>,
+
     /// Query string to vectorize and search semantically
-    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "download_models", "match_context"])]
+    #[arg(long, value_name = "TEXT", conflicts_with_all = ["path", "path_list", "download_models", "match_context"])]
     search: Option<String>,
 
     /// Lexical term to find and print merged neighboring text chunks for each source
@@ -162,6 +166,7 @@ struct QueryRecord {
 #[derive(Debug)]
 enum Mode<'a> {
     Ingest(&'a Path),
+    IngestList(&'a Path),
     Search(&'a str),
     MatchContext(&'a str),
     Web,
@@ -373,6 +378,19 @@ fn load_ignore_matcher(args: &Args) -> Result<IgnoreMatcher, Box<dyn std::error:
     }
 
     Ok(IgnoreMatcher { names, paths })
+}
+
+fn load_path_list(path_list: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path_list)?;
+    let mut paths = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        paths.push(PathBuf::from(trimmed));
+    }
+    Ok(paths)
 }
 
 fn path_matches_ignore_name(path: &Path, matcher: &IgnoreMatcher) -> bool {
@@ -850,6 +868,15 @@ async fn run_ingest(
     ignore_matcher: &IgnoreMatcher,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let files = collect_files(root_path, ignore_matcher)?;
+    run_ingest_file_set(args, connection, table_target, files).await
+}
+
+async fn run_ingest_file_set(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+    files: Vec<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let total_files = files.len();
     let mut session = start_worker(args)?;
     let mut table = open_table(connection, &table_target.table_name).await;
@@ -894,6 +921,16 @@ async fn run_ingest(
     );
 
     Ok(())
+}
+
+async fn run_ingest_list(
+    args: &Args,
+    connection: &Connection,
+    table_target: &TableTarget,
+    path_list: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let files = load_path_list(path_list)?;
+    run_ingest_file_set(args, connection, table_target, files).await
 }
 
 async fn run_watch(
@@ -1840,21 +1877,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = match (
         args.web,
         args.path.as_deref(),
+        args.path_list.as_deref(),
         args.search.as_deref(),
         args.match_context.as_deref(),
     ) {
-        (true, None, None, None) => Mode::Web,
-        (false, Some(path), None, None) => Mode::Ingest(path),
-        (false, None, Some(query), None) => Mode::Search(query),
-        (false, None, None, Some(term)) => Mode::MatchContext(term),
-        (true, _, _, _) => return Err("--web cannot be combined with other modes".into()),
-        (false, None, None, None) => {
-            return Err("either --path, --search, --match-context, or --web is required".into());
+        (true, None, None, None, None) => Mode::Web,
+        (false, Some(path), None, None, None) => Mode::Ingest(path),
+        (false, None, Some(path_list), None, None) => Mode::IngestList(path_list),
+        (false, None, None, Some(query), None) => Mode::Search(query),
+        (false, None, None, None, Some(term)) => Mode::MatchContext(term),
+        (true, _, _, _, _) => return Err("--web cannot be combined with other modes".into()),
+        (false, None, None, None, None) => {
+            return Err(
+                "either --path, --path-list, --search, --match-context, or --web is required"
+                    .into(),
+            );
         }
-        _ => return Err("use exactly one of --path, --search, --match-context, or --web".into()),
+        _ => {
+            return Err(
+                "use exactly one of --path, --path-list, --search, --match-context, or --web"
+                    .into(),
+            );
+        }
     };
 
-    if matches!(mode, Mode::Ingest(_)) {
+    if matches!(mode, Mode::Ingest(_) | Mode::IngestList(_)) {
         fs::create_dir_all(&table_target.db_root)?;
     }
 
@@ -1874,8 +1921,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_match_context(&args, &connection, &table_target, term).await;
     }
 
+    if let Mode::IngestList(path_list) = mode {
+        return run_ingest_list(&args, &connection, &table_target, path_list).await;
+    }
+
     let root_path = match mode {
         Mode::Ingest(path) => path,
+        Mode::IngestList(_) => unreachable!(),
         Mode::Search(_) => unreachable!(),
         Mode::MatchContext(_) => unreachable!(),
         Mode::Web => unreachable!(),
