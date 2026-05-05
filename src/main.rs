@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
 };
 
@@ -80,7 +80,7 @@ struct Args {
     script: PathBuf,
 
     /// Maximum number of search results to return
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 24)]
     limit: usize,
 
     /// Return search results as JSON
@@ -223,6 +223,7 @@ struct WebState {
     db_root: PathBuf,
     table_name: String,
     query_config: QueryConfig,
+    source_metadata: Arc<HashMap<String, SourceMetadataSummary>>,
 }
 
 #[derive(Clone)]
@@ -292,6 +293,8 @@ struct SearchRow {
     size_bytes: u64,
     modified_at: String,
     distance: Option<f64>,
+    match_phrase: Option<String>,
+    source_metadata: Option<SourceMetadataSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,7 +334,46 @@ struct CorpusEnrichmentSummary {
     concept_catalog: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceMetadataSummary {
+    source_id: String,
+    document_type: String,
+    title_guess: Option<String>,
+    collection_path: Vec<String>,
+    source_size_bytes: u64,
+    file_size_bytes: Option<u64>,
+    file_modified_unix: Option<u64>,
+    row_count: usize,
+    text_chunk_count: usize,
+    image_chunk_count: usize,
+    chunk_count: usize,
+    page_count: Option<u64>,
+    word_count: usize,
+    bibtex_candidate: BibtexCandidate,
+}
+
+impl From<&SourceMetadata> for SourceMetadataSummary {
+    fn from(source: &SourceMetadata) -> Self {
+        Self {
+            source_id: source.source_id.clone(),
+            document_type: source.document_type.clone(),
+            title_guess: source.title_guess.clone(),
+            collection_path: source.collection_path.clone(),
+            source_size_bytes: source.source_size_bytes,
+            file_size_bytes: source.file_size_bytes,
+            file_modified_unix: source.file_modified_unix,
+            row_count: source.row_count,
+            text_chunk_count: source.text_chunk_count,
+            image_chunk_count: source.image_chunk_count,
+            chunk_count: source.chunk_count,
+            page_count: source.page_count,
+            word_count: source.word_count,
+            bibtex_candidate: source.bibtex_candidate.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceMetadata {
     schema_version: u32,
     source_id: String,
@@ -359,7 +401,7 @@ struct SourceMetadata {
     enrichment_run: EnrichmentRunMetadata,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BibtexCandidate {
     entry_type: String,
     citation_key: String,
@@ -372,7 +414,7 @@ struct BibtexCandidate {
     bibtex: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnrichmentRunMetadata {
     tool: String,
     pass: String,
@@ -1336,7 +1378,129 @@ fn row_from_batch(
         size_bytes: column_u64(batch, "size_bytes", index),
         modified_at: column_string(batch, "modified_at", index)?,
         distance: column_distance(batch, index),
+        match_phrase: None,
+        source_metadata: None,
     })
+}
+
+fn normalized_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| term.chars().count() >= 4)
+        .filter(|term| {
+            !matches!(
+                term.as_str(),
+                "about"
+                    | "after"
+                    | "also"
+                    | "from"
+                    | "have"
+                    | "into"
+                    | "more"
+                    | "over"
+                    | "that"
+                    | "their"
+                    | "there"
+                    | "these"
+                    | "this"
+                    | "what"
+                    | "when"
+                    | "where"
+                    | "which"
+                    | "with"
+            )
+        })
+        .collect()
+}
+
+fn find_case_insensitive<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
+    if needle.trim().is_empty() {
+        return None;
+    }
+    if text.is_ascii() && needle.is_ascii() {
+        let text_lower = text.to_ascii_lowercase();
+        let needle_lower = needle.to_ascii_lowercase();
+        let start = text_lower.find(&needle_lower)?;
+        return text.get(start..start + needle.len());
+    }
+
+    let needle_lower = needle.to_lowercase();
+    for (start, _) in text.char_indices() {
+        for (end, _) in text
+            .char_indices()
+            .skip_while(|(index, _)| *index <= start)
+            .chain(std::iter::once((text.len(), '\0')))
+        {
+            let Some(candidate) = text.get(start..end) else {
+                continue;
+            };
+            let candidate_lower = candidate.to_lowercase();
+            if candidate_lower == needle_lower {
+                return Some(candidate);
+            }
+            if candidate_lower.len() > needle_lower.len() + 4 {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn infer_match_phrase(query: &str, snippet: &str) -> Option<String> {
+    let query = query.trim();
+    if let Some(value) = find_case_insensitive(snippet, query) {
+        return Some(value.to_string());
+    }
+
+    let mut quoted = Vec::new();
+    let mut in_quote = false;
+    let mut start = 0usize;
+    for (index, ch) in query.char_indices() {
+        if ch == '"' || ch == '\'' {
+            if in_quote {
+                let phrase = query[start..index].trim();
+                if phrase.chars().count() >= 4 {
+                    quoted.push(phrase.to_string());
+                }
+                in_quote = false;
+            } else {
+                in_quote = true;
+                start = index + ch.len_utf8();
+            }
+        }
+    }
+    quoted.sort_by_key(|phrase| std::cmp::Reverse(phrase.chars().count()));
+    for phrase in quoted {
+        if let Some(value) = find_case_insensitive(snippet, &phrase) {
+            return Some(value.to_string());
+        }
+    }
+
+    let terms = normalized_query_terms(query);
+    for width in (1..=terms.len().min(4)).rev() {
+        for window in terms.windows(width) {
+            let phrase = window.join(" ");
+            if let Some(value) = find_case_insensitive(snippet, &phrase) {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn enrich_search_rows(
+    rows: &mut [SearchRow],
+    query: Option<&str>,
+    source_metadata: &HashMap<String, SourceMetadataSummary>,
+) {
+    for row in rows {
+        if let Some(query) = query {
+            row.match_phrase = infer_match_phrase(query, &row.snippet);
+        }
+        row.source_metadata = source_metadata.get(&row.path).cloned();
+    }
 }
 
 async fn search_rows(
@@ -2429,6 +2593,43 @@ async fn connect_web_state(state: &WebState) -> Result<Connection, String> {
         .map_err(|err| err.to_string())
 }
 
+fn load_source_metadata_catalog(
+    path: &Path,
+) -> Result<HashMap<String, SourceMetadataSummary>, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut metadata = HashMap::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let source: SourceMetadata = serde_json::from_str(&line)?;
+        metadata.insert(source.path.clone(), SourceMetadataSummary::from(&source));
+    }
+    Ok(metadata)
+}
+
+fn web_metadata_catalog_path(args: &Args, table_target: &TableTarget) -> PathBuf {
+    if args.metadata_catalog.exists() {
+        return args.metadata_catalog.clone();
+    }
+    if let Some(parent) = table_target.db_root.parent() {
+        let sibling = parent
+            .join("wolfe-metadata")
+            .join(&table_target.table_name)
+            .join("catalog.jsonl");
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+    args.metadata_catalog.clone()
+}
+
 async fn web_search(
     State(state): State<WebState>,
     Query(params): Query<SearchParams>,
@@ -2440,12 +2641,12 @@ async fn web_search(
             "query must not be empty".to_string(),
         ));
     }
-    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let limit = params.limit.unwrap_or(24).clamp(1, 100);
     let offset = params.offset.unwrap_or(0);
     let connection = connect_web_state(&state)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    let results = search_rows(
+    let mut results = search_rows(
         &state.query_config,
         &connection,
         &state.table_name,
@@ -2455,6 +2656,7 @@ async fn web_search(
     )
     .await
     .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    enrich_search_rows(&mut results, Some(&query), &state.source_metadata);
     Ok(Json(SearchResponse {
         query,
         limit,
@@ -2521,9 +2723,10 @@ async fn web_context(
     let connection = connect_web_state(&state)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    let results = context_rows(&connection, &state.table_name, &params)
+    let mut results = context_rows(&connection, &state.table_name, &params)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    enrich_search_rows(&mut results, None, &state.source_metadata);
     Ok(Json(ContextResponse {
         path: params.path,
         window: params.window.unwrap_or(2).min(20),
@@ -2539,10 +2742,13 @@ async fn run_web(
     args: &Args,
     table_target: &TableTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let metadata_catalog = web_metadata_catalog_path(args, table_target);
+    let source_metadata = load_source_metadata_catalog(&metadata_catalog)?;
     let state = WebState {
         db_root: table_target.db_root.clone(),
         table_name: table_target.table_name.clone(),
         query_config: query_config_from_args(args),
+        source_metadata: Arc::new(source_metadata),
     };
     let app = Router::new()
         .route("/", get(web_index))
@@ -2600,7 +2806,7 @@ const WEB_INDEX: &str = r#"<!doctype html>
     }
     form {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 92px 96px;
+      grid-template-columns: minmax(0, 1fr) 92px 96px 88px;
       gap: 8px;
       margin-bottom: 14px;
     }
@@ -2660,9 +2866,29 @@ const WEB_INDEX: &str = r#"<!doctype html>
       font-size: 12px;
       word-break: break-all;
     }
+    .source-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 8px 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .source-meta span {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: #f9faf7;
+    }
     .snippet {
       margin: 8px 0;
       white-space: pre-wrap;
+    }
+    mark {
+      background: #fff2a8;
+      color: inherit;
+      border-radius: 3px;
+      padding: 0 2px;
     }
     aside {
       padding: 12px;
@@ -2704,8 +2930,9 @@ const WEB_INDEX: &str = r#"<!doctype html>
     <section>
       <form id="search-form">
         <input id="query" name="q" autocomplete="off" placeholder="Search the Wolfe corpus" required>
-        <input id="limit" name="limit" type="number" min="1" max="100" value="20" title="Limit">
+        <input id="limit" name="limit" type="number" min="1" max="100" value="24" title="Limit">
         <button id="search-button" type="submit">Search</button>
+        <button id="clear-button" class="secondary" type="button">Clear All</button>
       </form>
       <div id="status" class="status"></div>
       <div id="results" class="results"></div>
@@ -2720,9 +2947,11 @@ const WEB_INDEX: &str = r#"<!doctype html>
     const queryInput = document.getElementById('query');
     const limitInput = document.getElementById('limit');
     const button = document.getElementById('search-button');
+    const clearButton = document.getElementById('clear-button');
     const statusBox = document.getElementById('status');
     const resultsBox = document.getElementById('results');
     const contextBox = document.getElementById('context');
+    const initialContextText = 'Select a result to browse neighboring chunks.';
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
@@ -2733,6 +2962,46 @@ const WEB_INDEX: &str = r#"<!doctype html>
     function meta(row) {
       const distance = row.distance == null ? '' : ` distance ${Number(row.distance).toFixed(4)}`;
       return `${row.modality} ${row.extension || ''} ${row.unit}:${row.display_offset} chunk ${row.chunk}${distance}`;
+    }
+
+    function formatCount(value, unit) {
+      if (value == null || Number(value) === 0) return '';
+      return `${Number(value).toLocaleString()} ${unit}`;
+    }
+
+    function sourceMeta(row) {
+      const data = row.source_metadata;
+      if (!data) return '';
+      const parts = [
+        data.title_guess,
+        data.document_type,
+        data.collection_path?.length ? data.collection_path.join(' / ') : '',
+        formatCount(data.page_count, data.page_count === 1 ? 'page' : 'pages'),
+        formatCount(data.word_count, data.word_count === 1 ? 'word' : 'words'),
+        formatCount(data.chunk_count, data.chunk_count === 1 ? 'chunk' : 'chunks'),
+      ].filter(Boolean);
+      if (!parts.length) return '';
+      return `<div class="source-meta">${parts.map((part) => `<span>${escapeHtml(part)}</span>`).join('')}</div>`;
+    }
+
+    function highlightSnippet(text, phrase) {
+      const source = String(text ?? '');
+      const target = String(phrase ?? '').trim();
+      if (!target) return escapeHtml(source);
+      const lower = source.toLowerCase();
+      const needle = target.toLowerCase();
+      let index = lower.indexOf(needle);
+      if (index < 0) return escapeHtml(source);
+      let output = '';
+      let cursor = 0;
+      while (index >= 0) {
+        output += escapeHtml(source.slice(cursor, index));
+        output += `<mark>${escapeHtml(source.slice(index, index + needle.length))}</mark>`;
+        cursor = index + needle.length;
+        index = lower.indexOf(needle, cursor);
+      }
+      output += escapeHtml(source.slice(cursor));
+      return output;
     }
 
     function renderResults(rows) {
@@ -2750,7 +3019,8 @@ const WEB_INDEX: &str = r#"<!doctype html>
             </div>
             <button class="secondary" type="button" data-index="${index}">Context</button>
           </div>
-          <div class="snippet">${escapeHtml(row.snippet)}</div>
+          ${sourceMeta(row)}
+          <div class="snippet">${highlightSnippet(row.snippet, row.match_phrase)}</div>
         </article>
       `).join('');
       resultsBox.querySelectorAll('button[data-index]').forEach((node) => {
@@ -2790,24 +3060,43 @@ const WEB_INDEX: &str = r#"<!doctype html>
       renderContext(await response.json());
     }
 
+    function clearAll() {
+      queryInput.value = '';
+      limitInput.value = '24';
+      statusBox.textContent = '';
+      resultsBox.innerHTML = '';
+      contextBox.className = 'empty';
+      contextBox.textContent = initialContextText;
+      button.disabled = false;
+      form.removeAttribute('aria-busy');
+      queryInput.focus();
+    }
+
+    clearButton.addEventListener('click', clearAll);
+
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const q = queryInput.value.trim();
       if (!q) return;
       button.disabled = true;
-      statusBox.textContent = 'Searching...';
+      form.setAttribute('aria-busy', 'true');
+      statusBox.textContent = `Searching for "${q}"...`;
       resultsBox.innerHTML = '';
-      const params = new URLSearchParams({ q, limit: limitInput.value || '20' });
+      contextBox.className = 'empty';
+      contextBox.textContent = 'Search in progress.';
+      const params = new URLSearchParams({ q, limit: limitInput.value || '24' });
       try {
         const response = await fetch(`/api/search?${params}`);
         if (!response.ok) throw new Error(await response.text());
         const payload = await response.json();
-        statusBox.textContent = `${payload.results.length} results for "${payload.query}"`;
+        statusBox.textContent = `Search complete: ${payload.results.length} results for "${payload.query}"`;
         renderResults(payload.results);
+        contextBox.textContent = initialContextText;
       } catch (err) {
         statusBox.innerHTML = `<span class="error">${escapeHtml(err.message || err)}</span>`;
       } finally {
         button.disabled = false;
+        form.removeAttribute('aria-busy');
       }
     });
   </script>
