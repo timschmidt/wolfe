@@ -3,6 +3,11 @@ Multimodal semantic file search for intelligently investigating your files
 
 Local only, 100% offline, your data stays on your computer.
 
+For planned research-corpus enrichment beyond chunk search, including
+per-source metadata, bibliographic records, reference extraction, concepts,
+quotations, claims, figures, and review queues, see
+[`docs/science-corpus-enrichment-plan.md`](docs/science-corpus-enrichment-plan.md).
+
 # How it works
 Wolfe uses LibreOffice, ffmpeg, mupdf, F3D, and a small set of structured-text/container extractors to decompose almost any file into streams of audio, text, and images. Audio streams are processed through YAMNet to identify audio events and type. When speech is detected, an additional processing step through Whisper Large v3 is used to transcribe and optionally translate it to text. When music is detected, an additional processing step through Qwen 2.5 Omni 7B is used to characterize and describe the music in text. CAD / 3D files supported by F3D are inspected for textual metadata and rendered into a fixed set of centered orthographic screenshots from the cardinal directions plus an isometric view. Archives are unpacked and recursively ingested through the same pipeline, email files extract message text and attachments, SQLite databases extract schema and sample rows, and notebooks extract markdown, code, and textual outputs. The resulting streams of images and text are passed through Jina Embedding v4 to generate the embeddings stored in the database with file metadata.
 
