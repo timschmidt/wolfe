@@ -2,12 +2,15 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::channel;
 use std::sync::Arc;
+use std::sync::mpsc::channel;
 use std::{collections::HashSet, env};
 
 use arrow_array::types::Float32Type;
-use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+    UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::Parser;
 use futures::StreamExt;
@@ -21,7 +24,13 @@ use serde_json::json;
 #[command(author, version, about)]
 struct Args {
     /// Path to a file or directory to embed recursively
-    #[arg(short, long, value_name = "PATH", alias = "file", conflicts_with = "search")]
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        alias = "file",
+        conflicts_with = "search"
+    )]
     path: Option<PathBuf>,
 
     /// Query string to vectorize and search semantically
@@ -234,7 +243,10 @@ fn path_matches_ignore_name(path: &Path, matcher: &IgnoreMatcher) -> bool {
 }
 
 fn path_matches_ignore_path(path: &Path, matcher: &IgnoreMatcher) -> bool {
-    matcher.paths.iter().any(|ignored| path.starts_with(ignored))
+    matcher
+        .paths
+        .iter()
+        .any(|ignored| path.starts_with(ignored))
 }
 
 fn should_ignore_path(path: &Path, matcher: &IgnoreMatcher) -> bool {
@@ -265,7 +277,10 @@ fn build_schema(embedding_dim: i32) -> SchemaRef {
     ]))
 }
 
-fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+fn build_batch(
+    records: &[WorkerRecord],
+    embedding_dim: i32,
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
     let schema = build_schema(embedding_dim);
     let record_ids = StringArray::from_iter_values(
         records
@@ -293,14 +308,17 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
             .iter()
             .map(|record| record.modality.as_deref().unwrap_or("")),
     );
-    let chunks = UInt32Array::from_iter_values(records.iter().map(|record| record.chunk.unwrap_or(0)));
-    let offsets = UInt64Array::from_iter_values(records.iter().map(|record| record.offset.unwrap_or(0)));
+    let chunks =
+        UInt32Array::from_iter_values(records.iter().map(|record| record.chunk.unwrap_or(0)));
+    let offsets =
+        UInt64Array::from_iter_values(records.iter().map(|record| record.offset.unwrap_or(0)));
     let plaintexts = StringArray::from_iter_values(
         records
             .iter()
             .map(|record| record.plaintext.as_deref().unwrap_or("")),
     );
-    let sizes = UInt64Array::from_iter_values(records.iter().map(|record| record.size_bytes.unwrap_or(0)));
+    let sizes =
+        UInt64Array::from_iter_values(records.iter().map(|record| record.size_bytes.unwrap_or(0)));
     let modified_ats = StringArray::from_iter_values(
         records
             .iter()
@@ -308,7 +326,10 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
     );
     let embeddings = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         records.iter().map(|record| {
-            let vector = record.embedding.as_ref().expect("missing embedding for stored record");
+            let vector = record
+                .embedding
+                .as_ref()
+                .expect("missing embedding for stored record");
             Some(vector.iter().copied().map(Some).collect::<Vec<_>>())
         }),
         embedding_dim,
@@ -335,83 +356,13 @@ fn build_batch(records: &[WorkerRecord], embedding_dim: i32) -> Result<RecordBat
 
 // Source of truth for document extensions passed to the Python worker.
 const DOCUMENT_EXTENSIONS: &[&str] = &[
-    ".csv",
-    ".dbf",
-    ".dif",
-    ".doc",
-    ".docm",
-    ".docx",
-    ".dot",
-    ".dotm",
-    ".dotx",
-    ".fodg",
-    ".fodp",
-    ".fods",
-    ".fodt",
-    ".htm",
-    ".html",
-    ".mht",
-    ".mhtml",
-    ".odb",
-    ".odc",
-    ".odf",
-    ".odg",
-    ".odm",
-    ".odp",
-    ".ods",
-    ".odt",
-    ".oth",
-    ".otp",
-    ".ots",
-    ".ott",
-    ".otg",
-    ".otm",
-    ".pot",
-    ".potm",
-    ".potx",
-    ".pps",
-    ".ppsm",
-    ".ppsx",
-    ".ppt",
-    ".pptm",
-    ".pptx",
-    ".rtf",
-    ".sda",
-    ".sdc",
-    ".sdd",
-    ".sdw",
-    ".slk",
-    ".sxc",
-    ".sxd",
-    ".sxg",
-    ".sxi",
-    ".sxm",
-    ".sxw",
-    ".tab",
-    ".tsv",
-    ".txt",
-    ".uot",
-    ".uop",
-    ".uos",
-    ".uof",
-    ".vdx",
-    ".vsd",
-    ".vsdx",
-    ".wp",
-    ".wp4",
-    ".wp5",
-    ".wp6",
-    ".wp7",
-    ".wpd",
-    ".svg",
-    ".xhtml",
-    ".xls",
-    ".xlsm",
-    ".xlsx",
-    ".xlt",
-    ".xltm",
-    ".xltx",
-    ".xml",
+    ".csv", ".dbf", ".dif", ".doc", ".docm", ".docx", ".dot", ".dotm", ".dotx", ".fodg", ".fodp",
+    ".fods", ".fodt", ".htm", ".html", ".mht", ".mhtml", ".odb", ".odc", ".odf", ".odg", ".odm",
+    ".odp", ".ods", ".odt", ".oth", ".otp", ".ots", ".ott", ".otg", ".otm", ".pot", ".potm",
+    ".potx", ".pps", ".ppsm", ".ppsx", ".ppt", ".pptm", ".pptx", ".rtf", ".sda", ".sdc", ".sdd",
+    ".sdw", ".slk", ".sxc", ".sxd", ".sxg", ".sxi", ".sxm", ".sxw", ".tab", ".tsv", ".txt", ".uot",
+    ".uop", ".uos", ".uof", ".vdx", ".vsd", ".vsdx", ".wp", ".wp4", ".wp5", ".wp6", ".wp7", ".wpd",
+    ".svg", ".xhtml", ".xls", ".xlsm", ".xlsx", ".xlt", ".xltm", ".xltx", ".xml",
 ];
 
 fn is_document_extension(extension: &str) -> bool {
@@ -426,10 +377,37 @@ fn snippet_unit(modality: &str, extension: &str) -> &'static str {
     if extension == ".pdf" || is_document_extension(extension) {
         return "page";
     }
-    if matches!(extension, ".3gp" | ".mp4" | ".m2ts" | ".mkv" | ".mov" | ".avi" | ".m4v" | ".mpeg" | ".mpg" | ".ts" | ".webm") {
+    if matches!(
+        extension,
+        ".3gp"
+            | ".mp4"
+            | ".m2ts"
+            | ".mkv"
+            | ".mov"
+            | ".avi"
+            | ".m4v"
+            | ".mpeg"
+            | ".mpg"
+            | ".ts"
+            | ".webm"
+    ) {
         return "frame";
     }
-    if modality == "audio" || matches!(extension, ".aac" | ".aif" | ".aiff" | ".au" | ".flac" | ".m4a" | ".mp3" | ".ogg" | ".opus" | ".wav") {
+    if modality == "audio"
+        || matches!(
+            extension,
+            ".aac"
+                | ".aif"
+                | ".aiff"
+                | ".au"
+                | ".flac"
+                | ".m4a"
+                | ".mp3"
+                | ".ogg"
+                | ".opus"
+                | ".wav"
+        )
+    {
         return "second";
     }
     if modality == "text" {
@@ -469,9 +447,10 @@ async fn flush_records(
 
     match embedding_dim {
         Some(existing_dim) if *existing_dim != current_dim => {
-            return Err(
-                format!("embedding dimension changed from {existing_dim} to {current_dim}").into(),
+            return Err(format!(
+                "embedding dimension changed from {existing_dim} to {current_dim}"
             )
+            .into());
         }
         None => *embedding_dim = Some(current_dim),
         _ => {}
@@ -548,20 +527,34 @@ fn start_worker(args: &Args) -> Result<WorkerSession, Box<dyn std::error::Error>
         .arg(&args.device)
         .arg("--document-extensions")
         .arg(document_extensions_arg())
-        .args(if args.translate { vec!["--translate"] } else { Vec::new() })
+        .args(if args.translate {
+            vec!["--translate"]
+        } else {
+            Vec::new()
+        })
         .args(
             args.qwen_max_memory
                 .map(|value| vec!["--qwen-max-memory".to_string(), value.to_string()])
                 .unwrap_or_default(),
         )
-        .args(if args.low_memory { vec!["--low-memory"] } else { Vec::new() })
+        .args(if args.low_memory {
+            vec!["--low-memory"]
+        } else {
+            Vec::new()
+        })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdin = child.stdin.take().ok_or("failed to open embedding worker stdin")?;
-    let stdout = child.stdout.take().ok_or("failed to open embedding worker stdout")?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or("failed to open embedding worker stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("failed to open embedding worker stdout")?;
 
     Ok(WorkerSession {
         child,
@@ -587,7 +580,10 @@ fn download_models(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn send_worker_file(session: &mut WorkerSession, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn send_worker_file(
+    session: &mut WorkerSession,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let request = json!({
         "type": "file",
         "path": path.to_string_lossy(),
@@ -660,7 +656,8 @@ async fn ingest_single_path(
         }
     }
 
-    summary.stored += flush_records(connection, table_name, table, &mut pending, embedding_dim).await?;
+    summary.stored +=
+        flush_records(connection, table_name, table, &mut pending, embedding_dim).await?;
     Ok(summary)
 }
 
@@ -712,12 +709,7 @@ async fn run_ingest(
     };
 
     for (index, file) in files.into_iter().enumerate() {
-        eprintln!(
-            "ingest {}/{}: {}",
-            index + 1,
-            total_files,
-            file.display()
-        );
+        eprintln!("ingest {}/{}: {}", index + 1, total_files, file.display());
         let file_summary = ingest_single_path(
             &mut session,
             connection,
@@ -765,7 +757,10 @@ async fn run_watch(
     let watched_root = if watch_target.is_dir() {
         watch_target.clone()
     } else {
-        watch_target.parent().unwrap_or(Path::new(".")).to_path_buf()
+        watch_target
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
     };
     let target_file = if watch_target.is_file() {
         Some(watch_target.clone())
@@ -860,7 +855,10 @@ async fn read_query_embedding(
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdout = child.stdout.take().ok_or("failed to open query worker stdout")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("failed to open query worker stdout")?;
     let reader = BufReader::new(stdout);
     let mut embedding = None;
 
@@ -895,7 +893,8 @@ async fn run_search(
     query: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (range_start, range_end) = if let Some(range_value) = args.range.as_deref() {
-        let (start, end) = parse_range(range_value).map_err(|err| format!("invalid --range: {err}"))?;
+        let (start, end) =
+            parse_range(range_value).map_err(|err| format!("invalid --range: {err}"))?;
         (start, Some(end))
     } else {
         (0, None)
@@ -952,7 +951,9 @@ async fn run_search(
                 global_index += 1;
                 continue;
             }
-            if let Some(end) = range_end && global_index >= end {
+            if let Some(end) = range_end
+                && global_index >= end
+            {
                 return Ok(());
             }
             let path = paths.value(index);
@@ -976,7 +977,9 @@ async fn run_search(
                     "snippet": snippet_text,
                 }));
             } else {
-                println!("{path}\t{file_name}\t{modality}\t{unit}:{resolved_offset}\t{snippet_text}");
+                println!(
+                    "{path}\t{file_name}\t{modality}\t{unit}:{resolved_offset}\t{snippet_text}"
+                );
             }
             global_index += 1;
         }
@@ -989,7 +992,10 @@ async fn run_search(
     Ok(())
 }
 
-fn collect_files(path: &Path, ignore_matcher: &IgnoreMatcher) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn collect_files(
+    path: &Path,
+    ignore_matcher: &IgnoreMatcher,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     if should_ignore_path(path, ignore_matcher) {
         return Ok(Vec::new());
     }
@@ -999,7 +1005,11 @@ fn collect_files(path: &Path, ignore_matcher: &IgnoreMatcher) -> Result<Vec<Path
     }
 
     if !path.is_dir() {
-        return Err(format!("path does not exist or is not accessible: {}", path.display()).into());
+        return Err(format!(
+            "path does not exist or is not accessible: {}",
+            path.display()
+        )
+        .into());
     }
 
     let mut files = Vec::new();
@@ -1064,8 +1074,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if args.watch {
-        run_watch(&args, &connection, &table_target, root_path, &ignore_matcher).await
+        run_watch(
+            &args,
+            &connection,
+            &table_target,
+            root_path,
+            &ignore_matcher,
+        )
+        .await
     } else {
-        run_ingest(&args, &connection, &table_target, root_path, &ignore_matcher).await
+        run_ingest(
+            &args,
+            &connection,
+            &table_target,
+            root_path,
+            &ignore_matcher,
+        )
+        .await
     }
 }
